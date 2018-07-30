@@ -645,3 +645,54 @@ bind_ias_hmi(struct wl_client *client,
 							ias_surface_is_flipped(shsurf));
 	}
 }
+
+bool global_filter_func(const struct wl_client *client,
+						const struct wl_global *global,
+						void *data)
+{
+	pid_t pid;
+	const struct wl_interface *interface = wl_global_get_interface(global);
+	struct ias_shell *shell = data;
+	struct ias_output *ias_output;
+	struct soc_node *node;
+	char *p1, *p2;
+	int soc_num;
+
+	wl_client_get_credentials((struct wl_client *)client, &pid, NULL, NULL);
+
+	if(!strcmp(interface->name, "wl_output") ||
+			!strcmp(interface->name, "ias_output")) {
+
+		ias_output = wl_global_get_user_data(global);
+
+		wl_list_for_each(node, &shell->soc_list, link) {
+			if(pid == (int32_t) node->pid) {
+				if(!strncmp(ias_output->name, "SOC", 3)) {
+
+					/* This is a remote display */
+					p1 = strstr(ias_output->name, "SOC");
+					if(!p1) {
+						return true;
+					}
+					p2 = strchr(p1, ' ');
+					soc_num = atoi(p2);
+					if(!(node->soc & 1 << (soc_num -1))) {
+						return false;
+					}
+				} else {
+					/*
+					 * This is a local display so let's see if the remote
+					 * display app told us that the SoC for this pid is local
+					 * or not
+					 */
+					if(!(node->soc & 1)) {
+						return false;
+					}
+				}
+				break;
+			}
+		}
+	}
+
+	return true;
+}
