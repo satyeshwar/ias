@@ -41,13 +41,8 @@
 #include <linux/input.h>
 #include <drm_fourcc.h>
 #include <unistd.h>
-#include <sys/ioctl.h>
 
-#ifdef HAVE_LINUX_SYNC_FILE_H
-#include <linux/sync_file.h>
-#else
-#include "weston-sync-file.h"
-#endif
+#include "linux-sync-file.h"
 
 #include "timeline.h"
 
@@ -55,7 +50,10 @@
 #include "vertex-clipping.h"
 #include "linux-dmabuf.h"
 #include "linux-dmabuf-unstable-v1-server-protocol.h"
+#include "linux-explicit-synchronization.h"
+#include "pixel-formats.h"
 
+#include "shared/fd-util.h"
 #include "shared/helpers.h"
 #include "shared/platform.h"
 #include "shared/timespec-util.h"
@@ -141,25 +139,6 @@ get_renderer(struct weston_compositor *ec)
 	return (struct gl_renderer *)ec->renderer;
 }
 
-static int
-linux_sync_file_read_timestamp(int fd, uint64_t *ts)
-{
-	struct sync_file_info file_info = { { 0 } };
-	struct sync_fence_info fence_info = { { 0 } };
-
-	assert(ts != NULL);
-
-	file_info.sync_fence_info = (uint64_t)(uintptr_t)&fence_info;
-	file_info.num_fences = 1;
-
-	if (ioctl(fd, SYNC_IOC_FILE_INFO, &file_info) < 0)
-		return -1;
-
-	*ts = fence_info.timestamp_ns;
-
-	return 0;
-}
-
 static void
 timeline_render_point_destroy(struct timeline_render_point *trp)
 {
@@ -177,13 +156,9 @@ timeline_render_point_handler(int fd, uint32_t mask, void *data)
 			      "renderer_gpu_begin" : "renderer_gpu_end";
 
 	if (mask & WL_EVENT_READABLE) {
-		uint64_t ts;
+		struct timespec tspec = { 0 };
 
-		if (linux_sync_file_read_timestamp(trp->fd, &ts) == 0) {
-			struct timespec tspec = { 0 };
-
-			timespec_add_nsec(&tspec, &tspec, ts);
-
+		if (linux_sync_file_read_timestamp(trp->fd, &tspec) == 0) {
 			TL_POINT(tp_name, TLP_GPU(&tspec),
 				 TLP_OUTPUT(trp->output), TLP_END);
 		}
@@ -195,11 +170,11 @@ timeline_render_point_handler(int fd, uint32_t mask, void *data)
 }
 
 static EGLSyncKHR
-timeline_create_render_sync(struct gl_renderer *gr)
+create_render_sync(struct gl_renderer *gr)
 {
 	static const EGLint attribs[] = { EGL_NONE };
 
-	if (!weston_timeline_enabled_ || !gr->has_native_fence_sync)
+	if (!gr->has_native_fence_sync)
 		return EGL_NO_SYNC_KHR;
 
 	return gr->create_sync(gr->egl_display, EGL_SYNC_NATIVE_FENCE_ANDROID,
@@ -228,12 +203,12 @@ timeline_submit_render_sync(struct gl_renderer *gr,
 
 	fd = gr->dup_native_fence_fd(gr->egl_display, sync);
 	if (fd == EGL_NO_NATIVE_FENCE_FD_ANDROID)
-		goto out;
+		return;
 
 	trp = zalloc(sizeof *trp);
 	if (trp == NULL) {
 		close(fd);
-		goto out;
+		return;
 	}
 
 	trp->type = type;
@@ -245,9 +220,6 @@ timeline_submit_render_sync(struct gl_renderer *gr,
 						 trp);
 
 	wl_list_insert(&go->timeline_render_point_list, &trp->link);
-
-out:
-	gr->destroy_sync(gr->egl_display, sync);
 }
 
 static struct egl_image*
@@ -729,6 +701,72 @@ shader_uniforms(struct gl_shader *shader,
 		glUniform1i(shader->tex_uniforms[i], i);
 }
 
+static int
+ensure_surface_buffer_is_ready(struct gl_renderer *gr,
+			       struct gl_surface_state *gs)
+{
+	EGLint attribs[] = {
+		EGL_SYNC_NATIVE_FENCE_FD_ANDROID,
+		-1,
+		EGL_NONE
+	};
+	struct weston_surface *surface = gs->surface;
+	struct weston_buffer *buffer = gs->buffer_ref.buffer;
+	EGLSyncKHR sync;
+	EGLint wait_ret;
+	EGLint destroy_ret;
+
+	if (!buffer)
+		return 0;
+
+	if (surface->acquire_fence_fd < 0)
+		return 0;
+
+	/* We should only get a fence if we support EGLSyncKHR, since
+	 * we don't advertise the explicit sync protocol otherwise. */
+	assert(gr->has_native_fence_sync);
+	/* We should only get a fence for non-SHM buffers, since surface
+	 * commit would have failed otherwise. */
+	assert(wl_shm_buffer_get(buffer->resource) == NULL);
+
+	attribs[1] = dup(surface->acquire_fence_fd);
+	if (attribs[1] == -1) {
+		linux_explicit_synchronization_send_server_error(
+			gs->surface->synchronization_resource,
+			"Failed to dup acquire fence");
+		return -1;
+	}
+
+	sync = gr->create_sync(gr->egl_display,
+			       EGL_SYNC_NATIVE_FENCE_ANDROID,
+			       attribs);
+	if (sync == EGL_NO_SYNC_KHR) {
+		linux_explicit_synchronization_send_server_error(
+			gs->surface->synchronization_resource,
+			"Failed to create EGLSyncKHR object");
+		close(attribs[1]);
+		return -1;
+	}
+
+	wait_ret = gr->wait_sync(gr->egl_display, sync, 0);
+	if (wait_ret == EGL_FALSE) {
+		linux_explicit_synchronization_send_server_error(
+			gs->surface->synchronization_resource,
+			"Failed to wait on EGLSyncKHR object");
+		/* Continue to try to destroy the sync object. */
+	}
+
+
+	destroy_ret = gr->destroy_sync(gr->egl_display, sync);
+	if (destroy_ret == EGL_FALSE) {
+		linux_explicit_synchronization_send_server_error(
+			gs->surface->synchronization_resource,
+			"Failed to destroy on EGLSyncKHR object");
+	}
+
+	return (wait_ret == EGL_TRUE && destroy_ret == EGL_TRUE) ? 0 : -1;
+}
+
 static void
 draw_view(struct weston_view *ev, struct weston_output *output,
 	  pixman_region32_t *damage) /* in global coordinates */
@@ -758,6 +796,9 @@ draw_view(struct weston_view *ev, struct weston_output *output,
 	pixman_region32_subtract(&repaint, &repaint, &ev->clip);
 
 	if (!pixman_region32_not_empty(&repaint))
+		goto out;
+
+	if (ensure_surface_buffer_is_ready(gr, gs) < 0)
 		goto out;
 
 	if (go->alpha_available) {
@@ -822,12 +863,14 @@ draw_view(struct weston_view *ev, struct weston_output *output,
 			glDisable(GL_BLEND);
 
 		repaint_region(ev, &repaint, &surface_opaque);
+		gs->used_in_output_repaint = true;
 	}
 
 	if (pixman_region32_not_empty(&surface_blend)) {
 		use_shader(gr, gs->shader);
 		glEnable(GL_BLEND);
 		repaint_region(ev, &repaint, &surface_blend);
+		gs->used_in_output_repaint = true;
 	}
 
 	pixman_region32_fini(&surface_blend);
@@ -846,6 +889,73 @@ repaint_views(struct weston_output *output, pixman_region32_t *damage)
 	wl_list_for_each_reverse(view, &compositor->view_list, link)
 		if (view->plane == &compositor->primary_plane)
 			draw_view(view, output, damage);
+}
+
+static int
+gl_renderer_create_fence_fd(struct weston_output *output);
+
+/* Updates the release fences of surfaces that were used in the current output
+ * repaint. Should only be used from gl_renderer_repaint_output, so that the
+ * information in gl_surface_state.used_in_output_repaint is accurate.
+ */
+static void
+update_buffer_release_fences(struct weston_compositor *compositor,
+			     struct weston_output *output)
+{
+	struct weston_view *view;
+
+	wl_list_for_each_reverse(view, &compositor->view_list, link) {
+		struct gl_surface_state *gs;
+		struct weston_buffer_release *buffer_release;
+		int fence_fd;
+
+		if (view->plane != &compositor->primary_plane)
+			continue;
+
+		gs = get_surface_state(view->surface);
+		buffer_release = gs->buffer_release_ref.buffer_release;
+
+		if (!gs->used_in_output_repaint || !buffer_release)
+			continue;
+
+		fence_fd = gl_renderer_create_fence_fd(output);
+
+		/* If we have a buffer_release then it means we support fences,
+		 * and we should be able to create the release fence. If we
+		 * can't, something has gone horribly wrong, so disconnect the
+		 * client.
+		 */
+		if (fence_fd == -1) {
+			linux_explicit_synchronization_send_server_error(
+				buffer_release->resource,
+				"Failed to create release fence");
+			fd_clear(&buffer_release->fence_fd);
+			continue;
+		}
+
+		/* At the moment it is safe to just replace the fence_fd,
+		 * discarding the previous one:
+		 *
+		 * 1. If the previous fence fd represents a sync fence from
+		 *    a previous repaint cycle, that fence fd is now not
+		 *    sufficient to provide the release guarantee and should
+		 *    be replaced.
+		 *
+		 * 2. If the fence fd represents a sync fence from another
+		 *    output in the same repaint cycle, it's fine to replace
+		 *    it since we are rendering to all outputs using the same
+		 *    EGL context, so a fence issued for a later output rendering
+		 *    is guaranteed to signal after fences for previous output
+		 *    renderings.
+		 *
+		 * Note that the above is only valid if the buffer_release
+		 * fences only originate from the GL renderer, which guarantees
+		 * a total order of operations and fences.  If we introduce
+		 * fences from other sources (e.g., plane out-fences), we will
+		 * need to merge fences instead.
+		 */
+		fd_update(&buffer_release->fence_fd, fence_fd);
+	}
 }
 
 static void
@@ -1163,18 +1273,33 @@ gl_renderer_repaint_output(struct weston_output *output,
 	EGLint *egl_damage, *d;
 	pixman_box32_t *rects;
 #endif
-	EGLSyncKHR begin_render_sync, end_render_sync;
+	struct weston_view *view;
 
 	if (use_output(output) < 0)
 		return;
 
-	begin_render_sync = timeline_create_render_sync(gr);
+	/* Clear the used_in_output_repaint flag, so that we can properly track
+	 * which surfaces were used in this output repaint. */
+	wl_list_for_each_reverse(view, &compositor->view_list, link) {
+		if (view->plane == &compositor->primary_plane) {
+			struct gl_surface_state *gs =
+				get_surface_state(view->surface);
+			gs->used_in_output_repaint = false;
+		}
+	}
+
+	if (go->begin_render_sync != EGL_NO_SYNC_KHR)
+		gr->destroy_sync(gr->egl_display, go->begin_render_sync);
+	if (go->end_render_sync != EGL_NO_SYNC_KHR)
+		gr->destroy_sync(gr->egl_display, go->end_render_sync);
+
+	go->begin_render_sync = create_render_sync(gr);
 
 	gl_renderer_repaint_output_base(output, output_damage);
 
 	wl_signal_emit(&output->frame_signal, output);
 
-	end_render_sync = timeline_create_render_sync(gr);
+	go->end_render_sync = create_render_sync(gr);
 
 	if (gr->swap_buffers_with_damage) {
 		pixman_region32_init(&buffer_damage);
@@ -1227,10 +1352,13 @@ gl_renderer_repaint_output(struct weston_output *output,
 	/* We have to submit the render sync objects after swap buffers, since
 	 * the objects get assigned a valid sync file fd only after a gl flush.
 	 */
-	timeline_submit_render_sync(gr, compositor, output, begin_render_sync,
+	timeline_submit_render_sync(gr, compositor, output,
+				    go->begin_render_sync,
 				    TIMELINE_RENDER_POINT_TYPE_BEGIN);
-	timeline_submit_render_sync(gr, compositor, output, end_render_sync,
+	timeline_submit_render_sync(gr, compositor, output, go->end_render_sync,
 				    TIMELINE_RENDER_POINT_TYPE_END);
+
+	update_buffer_release_fences(compositor, output);
 }
 
 static int
@@ -1389,6 +1517,7 @@ done:
 	gs->needs_full_upload = false;
 
 	weston_buffer_reference(&gs->buffer_ref, NULL);
+	weston_buffer_release_reference(&gs->buffer_release_ref, NULL);
 }
 
 static void
@@ -1438,18 +1567,21 @@ gl_renderer_attach_shm(struct weston_surface *es, struct weston_buffer *buffer,
 		pitch = wl_shm_buffer_get_stride(shm_buffer) / 4;
 		gl_format[0] = GL_BGRA_EXT;
 		gl_pixel_type = GL_UNSIGNED_BYTE;
+		es->is_opaque = true;
 		break;
 	case WL_SHM_FORMAT_ARGB8888:
 		gs->shader = &gr->texture_shader_rgba;
 		pitch = wl_shm_buffer_get_stride(shm_buffer) / 4;
 		gl_format[0] = GL_BGRA_EXT;
 		gl_pixel_type = GL_UNSIGNED_BYTE;
+		es->is_opaque = false;
 		break;
 	case WL_SHM_FORMAT_RGB565:
 		gs->shader = &gr->texture_shader_rgbx;
 		pitch = wl_shm_buffer_get_stride(shm_buffer) / 2;
 		gl_format[0] = GL_RGB;
 		gl_pixel_type = GL_UNSIGNED_SHORT_5_6_5;
+		es->is_opaque = true;
 		break;
 	case WL_SHM_FORMAT_YUV420:
 		gs->shader = &gr->texture_shader_y_u_v;
@@ -1473,6 +1605,7 @@ gl_renderer_attach_shm(struct weston_surface *es, struct weston_buffer *buffer,
 			gl_format[1] = GL_LUMINANCE;
 			gl_format[2] = GL_LUMINANCE;
 		}
+		es->is_opaque = true;
 		break;
 	case WL_SHM_FORMAT_NV12:
 		pitch = wl_shm_buffer_get_stride(shm_buffer);
@@ -1491,12 +1624,14 @@ gl_renderer_attach_shm(struct weston_surface *es, struct weston_buffer *buffer,
 			gl_format[0] = GL_LUMINANCE;
 			gl_format[1] = GL_LUMINANCE_ALPHA;
 		}
+		es->is_opaque = true;
 		break;
 	case WL_SHM_FORMAT_YUYV:
 		gs->shader = &gr->texture_shader_y_xuxv;
 		pitch = wl_shm_buffer_get_stride(shm_buffer) / 2;
 		gl_pixel_type = GL_UNSIGNED_BYTE;
 		num_planes = 2;
+		gs->offset[1] = 0;
 		gs->hsub[1] = 2;
 		gs->vsub[1] = 1;
 		if (gr->has_gl_texture_rg)
@@ -1504,6 +1639,7 @@ gl_renderer_attach_shm(struct weston_surface *es, struct weston_buffer *buffer,
 		else
 			gl_format[0] = GL_LUMINANCE_ALPHA;
 		gl_format[1] = GL_BGRA_EXT;
+		es->is_opaque = true;
 		break;
 	default:
 		weston_log("warning: unknown shm buffer format: %08x\n",
@@ -1562,8 +1698,11 @@ gl_renderer_attach_egl(struct weston_surface *es, struct weston_buffer *buffer,
 	}
 	gs->num_images = 0;
 	gs->target = GL_TEXTURE_2D;
+	es->is_opaque = false;
 	switch (format) {
 	case EGL_TEXTURE_RGB:
+		es->is_opaque = true;
+		/* fallthrough */
 	case EGL_TEXTURE_RGBA:
 	default:
 		num_planes = 1;
@@ -1577,14 +1716,17 @@ gl_renderer_attach_egl(struct weston_surface *es, struct weston_buffer *buffer,
 	case EGL_TEXTURE_Y_UV_WL:
 		num_planes = 2;
 		gs->shader = &gr->texture_shader_y_uv;
+		es->is_opaque = true;
 		break;
 	case EGL_TEXTURE_Y_U_V_WL:
 		num_planes = 3;
 		gs->shader = &gr->texture_shader_y_u_v;
+		es->is_opaque = true;
 		break;
 	case EGL_TEXTURE_Y_XUXV_WL:
 		num_planes = 2;
 		gs->shader = &gr->texture_shader_y_xuxv;
+		es->is_opaque = true;
 		break;
 	}
 
@@ -2059,7 +2201,9 @@ gl_renderer_query_dmabuf_modifiers(struct weston_compositor *wc, int format,
 		 * them out.
 		 */
 		if(gl_renderer_interface.rbc ||
-			(temp_modifiers[i] != I915_FORMAT_MOD_Y_TILED_CCS &&
+			(temp_modifiers[i] != I915_FORMAT_MOD_Y_TILED &&
+			temp_modifiers[i] != I915_FORMAT_MOD_Yf_TILED &&
+			temp_modifiers[i] != I915_FORMAT_MOD_Y_TILED_CCS &&
 			temp_modifiers[i] != I915_FORMAT_MOD_Yf_TILED_CCS)) {
 			(*modifiers)[j++] = temp_modifiers[i];
 		}
@@ -2129,6 +2273,19 @@ import_known_dmabuf(struct gl_renderer *gr,
 	}
 
 	return true;
+}
+
+static bool
+dmabuf_is_opaque(struct linux_dmabuf_buffer *dmabuf)
+{
+	const struct pixel_format_info *info;
+
+	info = pixel_format_get_info(dmabuf->attributes.format &
+				     ~DRM_FORMAT_BIG_ENDIAN);
+	if (!info)
+		return false;
+
+	return pixel_format_is_opaque(info);
 }
 
 static void
@@ -2203,6 +2360,7 @@ gl_renderer_attach_dmabuf(struct weston_surface *surface,
 	gs->height = buffer->height;
 	gs->buffer_type = BUFFER_TYPE_EGL;
 	gs->y_inverted = buffer->y_inverted;
+	surface->is_opaque = dmabuf_is_opaque(dmabuf);
 }
 
 static void
@@ -2217,6 +2375,8 @@ gl_renderer_attach(struct weston_surface *es, struct weston_buffer *buffer)
 	int i;
 
 	weston_buffer_reference(&gs->buffer_ref, buffer);
+	weston_buffer_release_reference(&gs->buffer_release_ref,
+					es->buffer_release_ref.buffer_release);
 
 	if (!buffer) {
 		for (i = 0; i < gs->num_images; i++) {
@@ -2228,6 +2388,7 @@ gl_renderer_attach(struct weston_surface *es, struct weston_buffer *buffer)
 		gs->num_textures = 0;
 		gs->buffer_type = BUFFER_TYPE_NULL;
 		gs->y_inverted = 1;
+		es->is_opaque = false;
 		return;
 	}
 
@@ -2243,9 +2404,17 @@ gl_renderer_attach(struct weston_surface *es, struct weston_buffer *buffer)
 		gl_renderer_attach_dmabuf(es, buffer, dmabuf);
 	else {
 		weston_log("unhandled buffer type!\n");
+		if (gr->has_bind_display) {
+		  weston_log("eglQueryWaylandBufferWL failed\n");
+		  gl_renderer_print_egl_error_state();
+		}
 		weston_buffer_reference(&gs->buffer_ref, NULL);
+		weston_buffer_release_reference(&gs->buffer_release_ref, NULL);
 		gs->buffer_type = BUFFER_TYPE_NULL;
 		gs->y_inverted = 1;
+		es->is_opaque = false;
+                weston_buffer_send_server_error(buffer,
+			"disconnecting due to unhandled buffer type");
 	}
 
 	gs->frame_count++;
@@ -2430,6 +2599,7 @@ surface_state_destroy(struct gl_surface_state *gs, struct gl_renderer *gr)
 		egl_image_unref(gs->images[i]);
 
 	weston_buffer_reference(&gs->buffer_ref, NULL);
+	weston_buffer_release_reference(&gs->buffer_release_ref, NULL);
 	pixman_region32_fini(&gs->texture_damage);
 	free(gs);
 }
@@ -2951,7 +3121,7 @@ log_extensions(const char *name, const char *extensions)
 }
 
 static void
-log_egl_gl_info(EGLDisplay egldpy)
+log_egl_info(EGLDisplay egldpy)
 {
 	const char *str;
 
@@ -2966,6 +3136,12 @@ log_egl_gl_info(EGLDisplay egldpy)
 
 	str = eglQueryString(egldpy, EGL_EXTENSIONS);
 	log_extensions("EGL extensions", str ? str : "(null)");
+}
+
+static void
+log_gl_info(void)
+{
+	const char *str;
 
 	str = (char *)glGetString(GL_VERSION);
 	weston_log("GL version: %s\n", str ? str : "(null)");
@@ -3170,6 +3346,9 @@ gl_renderer_output_create(struct weston_output *output,
 
 	wl_list_init(&go->timeline_render_point_list);
 
+	go->begin_render_sync = EGL_NO_SYNC_KHR;
+	go->end_render_sync = EGL_NO_SYNC_KHR;
+
 	output->renderer_state = go;
 
 	VM_OUTPUT_INIT(output);
@@ -3237,6 +3416,11 @@ gl_renderer_output_destroy(struct weston_output *output)
 	wl_list_for_each_safe(trp, tmp, &go->timeline_render_point_list, link)
 		timeline_render_point_destroy(trp);
 
+	if (go->begin_render_sync != EGL_NO_SYNC_KHR)
+		gr->destroy_sync(gr->egl_display, go->begin_render_sync);
+	if (go->end_render_sync != EGL_NO_SYNC_KHR)
+		gr->destroy_sync(gr->egl_display, go->end_render_sync);
+
 	free(go);
 }
 
@@ -3299,6 +3483,23 @@ static EGLSurface
 gl_renderer_output_surface(struct weston_output *output)
 {
 	return get_output_state(output)->egl_surface;
+}
+
+static int
+gl_renderer_create_fence_fd(struct weston_output *output)
+{
+	struct gl_output_state *go = get_output_state(output);
+	struct gl_renderer *gr = get_renderer(output->compositor);
+	int fd;
+
+	if (go->end_render_sync == EGL_NO_SYNC_KHR)
+		return -1;
+
+	fd = gr->dup_native_fence_fd(gr->egl_display, go->end_render_sync);
+	if (fd == EGL_NO_NATIVE_FENCE_FD_ANDROID)
+		return -1;
+
+	return fd;
 }
 
 static void
@@ -3442,9 +3643,6 @@ gl_renderer_setup_egl_extensions(struct weston_compositor *ec)
 
 	if (weston_check_egl_extension(extensions, "EGL_EXT_buffer_age"))
 		gr->has_egl_buffer_age = 1;
-	else
-		weston_log("warning: EGL_EXT_buffer_age not supported. "
-			   "Performance could be affected.\n");
 
 	for (i = 0; i < ARRAY_LENGTH(swap_damage_ext_to_entrypoint); i++) {
 		if (weston_check_egl_extension(extensions,
@@ -3455,11 +3653,6 @@ gl_renderer_setup_egl_extensions(struct weston_compositor *ec)
 			break;
 		}
 	}
-	if (!gr->swap_buffers_with_damage)
-		weston_log("warning: neither %s or %s is supported. "
-			   "Performance could be affected.\n",
-			   swap_damage_ext_to_entrypoint[0].extension,
-			   swap_damage_ext_to_entrypoint[1].extension);
 
 	if (weston_check_egl_extension(extensions, "EGL_KHR_no_config_context") ||
 	    weston_check_egl_extension(extensions, "EGL_MESA_configless_context"))
@@ -3490,8 +3683,17 @@ gl_renderer_setup_egl_extensions(struct weston_compositor *ec)
 			(void *) eglGetProcAddress("eglDupNativeFenceFDANDROID");
 		gr->has_native_fence_sync = 1;
 	} else {
-		weston_log("warning: Disabling render GPU timeline due to "
-			   "missing EGL_ANDROID_native_fence_sync extension\n");
+		weston_log("warning: Disabling render GPU timeline and explicit "
+			   "synchronization due to missing "
+			   "EGL_ANDROID_native_fence_sync extension\n");
+	}
+
+	if (weston_check_egl_extension(extensions, "EGL_KHR_wait_sync")) {
+		gr->wait_sync = (void *) eglGetProcAddress("eglWaitSyncKHR");
+		gr->has_wait_sync = 1;
+	} else {
+		weston_log("warning: Disabling explicit synchronization due"
+			   "to missing EGL_KHR_wait_sync extension\n");
 	}
 
 	renderer_setup_egl_client_extensions(gr);
@@ -3718,6 +3920,8 @@ gl_renderer_display_create(struct weston_compositor *ec, EGLenum platform,
 		goto fail_with_error;
 	}
 
+	log_egl_info(gr->egl_display);
+
 	if (egl_choose_config(gr, config_attribs, visual_id,
 			      n_ids, &gr->egl_config) < 0) {
 		weston_log("failed to choose EGL config\n");
@@ -3725,12 +3929,15 @@ gl_renderer_display_create(struct weston_compositor *ec, EGLenum platform,
 	}
 
 	ec->renderer = &gr->base;
-	ec->capabilities |= WESTON_CAP_ROTATION_ANY;
-	ec->capabilities |= WESTON_CAP_CAPTURE_YFLIP;
-	ec->capabilities |= WESTON_CAP_VIEW_CLIP_MASK;
 
 	if (gl_renderer_setup_egl_extensions(ec) < 0)
 		goto fail_with_error;
+
+	ec->capabilities |= WESTON_CAP_ROTATION_ANY;
+	ec->capabilities |= WESTON_CAP_CAPTURE_YFLIP;
+	ec->capabilities |= WESTON_CAP_VIEW_CLIP_MASK;
+	if (gr->has_native_fence_sync && gr->has_wait_sync)
+		ec->capabilities |= WESTON_CAP_EXPLICIT_SYNC;
 
 	wl_list_init(&gr->dmabuf_images);
 	if (gr->has_dmabuf_import) {
@@ -3974,7 +4181,7 @@ gl_renderer_setup(struct weston_compositor *ec, EGLSurface egl_surface)
 		gr->gl_version = GR_GL_VERSION(2, 0);
 	}
 
-	log_egl_gl_info(gr->egl_display);
+	log_gl_info();
 
 	gr->image_target_texture_2d =
 		(void *) eglGetProcAddress("glEGLImageTargetTexture2DOES");
@@ -4079,6 +4286,7 @@ WL_EXPORT struct gl_renderer_interface gl_renderer_interface = {
 	.output_destroy = gl_renderer_output_destroy,
 	.output_surface = gl_renderer_output_surface,
 	.output_set_border = gl_renderer_output_set_border,
+	.create_fence_fd = gl_renderer_create_fence_fd,
 	.print_egl_error_state = gl_renderer_print_egl_error_state,
 	.use_output = use_output,
 	.swap_output_buffers = gl_renderer_swap_output_buffers,

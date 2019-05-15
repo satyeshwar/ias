@@ -74,7 +74,7 @@
 #define EGL_PLATFORM_GBM_KHR 0x31D7
 #endif
 
-#ifdef BUILD_FRAME_CAPTURE
+#ifdef BUILD_REMOTE_DISPLAY
 #include "capture-proxy.h"
 #include "../shared/timespec-util.h"
 #include "ias-shell-server-protocol.h"
@@ -1310,8 +1310,8 @@ ias_output_scale(struct ias_output *ias_output,
 			 * will receive the swapped width and height.
 			 */
 			if (compositor->normalized_rotation) {
-				output->mm_width = height;
-				output->mm_height = width;
+				weston_head_set_physical_size(&ias_output->head,
+							      height, width);
 			}
 
 			break;
@@ -2367,6 +2367,8 @@ ias_output_destroy(struct weston_output *output_base)
 	//wl_list_remove(&output->base.link);
 	wl_list_remove(&output->link);
 
+	weston_head_release(&output->head);
+
 	wl_global_destroy(output->global);
 	free(output);
 }
@@ -2395,7 +2397,6 @@ on_ias_input(int fd, uint32_t mask, void *data)
 
 	memset(&evctx, 0, sizeof evctx);
 	evctx.version = DRM_EVENT_CONTEXT_VERSION;
-	evctx.page_flip_handler = page_flip_handler;
 	evctx.page_flip_handler = page_flip_handler;
 	evctx.vblank_handler = vblank_handler;
 	drmHandleEvent(fd, &evctx);
@@ -2724,8 +2725,9 @@ ias_backend_output_enable(struct weston_output *base)
 					ias_output->name);
 	}
 
-	ias_output->base.mm_width = ias_output->width;
-	ias_output->base.mm_height = ias_output->height;
+	weston_head_set_physical_size(&ias_output->head,
+				      ias_output->width,
+				      ias_output->height);
 
 	/* Hook up implementation */
 	ias_output->base.repaint = ias_output_repaint;
@@ -2756,6 +2758,7 @@ create_outputs_for_crtc(struct ias_backend *backend, struct ias_crtc *ias_crtc)
 	struct ias_configured_output *cfg;
 	int i, scale;
 	char *temp_name = NULL;
+	struct timeval curr_time;
 
 	for (i = 0; i < ias_crtc->num_outputs; i++) {
 		if (ias_crtc->configuration == NULL) {
@@ -2778,6 +2781,11 @@ create_outputs_for_crtc(struct ias_backend *backend, struct ias_crtc *ias_crtc)
 		ias_output->ias_crtc = ias_crtc;
 		ias_output->vm = ias_crtc->configuration->output[i]->vm;
 
+		/* Use connector name from ias.conf also for head*/
+		weston_head_init(&ias_output->head, ias_crtc->name);
+
+		weston_compositor_add_head(backend->compositor, &ias_output->head);
+
 		/*
 		 * Initialize output size according to output model.  The general case
 		 * that we assume here is that the output inherits its dimensions from
@@ -2799,16 +2807,13 @@ create_outputs_for_crtc(struct ias_backend *backend, struct ias_crtc *ias_crtc)
 
 		ias_output->base.current_mode = &ias_output->mode;
 		ias_output->base.original_mode = &ias_output->mode;
-		ias_output->base.subpixel = ias_subpixel_to_wayland(ias_crtc->subpixel);
-		ias_output->base.make = "unknown";
-		ias_output->base.model = "unknown";
 
 		wl_signal_init(&ias_output->update_signal);
 		wl_signal_init(&ias_output->printfps_signal);
-#if defined(BUILD_VAAPI_RECORDER) || defined(BUILD_FRAME_CAPTURE)
+#if defined(BUILD_VAAPI_RECORDER) || defined(BUILD_REMOTE_DISPLAY)
 		wl_signal_init(&ias_output->next_scanout_ready_signal);
 #endif
-#ifdef BUILD_FRAME_CAPTURE
+#ifdef BUILD_REMOTE_DISPLAY
 		wl_signal_init(&ias_output->base.commit_signal);
 #endif
 
@@ -2870,16 +2875,20 @@ create_outputs_for_crtc(struct ias_backend *backend, struct ias_crtc *ias_crtc)
 		ias_output->base.destroy = ias_output_destroy;
 		ias_output->base.disable = ias_backend_output_disable;
 
+		gettimeofday(&curr_time, NULL);
+		ias_output->prev_time_ms = (curr_time.tv_sec * 1000 + curr_time.tv_usec / 1000);
 
-		ias_output->base.make = "unknown";
-		ias_output->base.model = "unknown";
-		ias_output->base.serial_number = "unknown";
+		weston_head_set_monitor_strings(&ias_output->head,
+						"unknown", "unknown", "unknown");
+		weston_head_set_subpixel(&ias_output->head,
+					 ias_subpixel_to_wayland(ias_crtc->subpixel));
 
 		wl_list_insert(&ias_output->base.mode_list, &ias_output->mode.link);
 
 		weston_output_set_scale(&ias_output->base, scale);
 		weston_output_set_transform(&ias_output->base, ias_output->rotation);
 
+		weston_output_attach_head(&ias_output->base, &ias_output->head);
 		weston_output_enable(&ias_output->base);
 
 		weston_plane_init(&ias_output->fb_plane, backend->compositor, ias_output->base.x,
@@ -3495,7 +3504,7 @@ cleanup_hyper_dmabuf(struct ias_backend *backend)
 }
 #endif
 
-#ifdef BUILD_FRAME_CAPTURE
+#ifdef BUILD_REMOTE_DISPLAY
 static void
 capture_proxy_destroy_from_output(struct ias_output *output)
 {
@@ -3971,8 +3980,8 @@ start_capture(struct wl_client *client,
 
 		capture_proxy_item->capture_commit_listener.notify =
 			capture_commit_notify;
-		wl_signal_add(&output->base.commit_signal,
-			  &capture_proxy_item->capture_commit_listener);
+		wl_signal_add(&surface->commit_signal,
+				&capture_proxy_item->capture_commit_listener);
 
 		wl_list_init(&capture_proxy_item->link);
 		wl_list_insert(&ias_backend->capture_proxy_list, &capture_proxy_item->link);
@@ -4135,7 +4144,37 @@ release_buffer_handle(struct ias_backend *ias_backend, uint32_t surfid,
 	return IAS_HMI_FCAP_ERROR_OK;
 }
 
-#endif /*BUILD_FRAME_CAPTURE*/
+int change_capture_output(struct ias_backend *ias_backend,
+		struct weston_surface *surface)
+{
+	struct ias_surface_capture *capture_item;
+	struct ias_output *output;
+
+	if (surface->output) {
+		output = container_of(surface->output, struct ias_output,
+			base);
+	} else {
+		weston_log("Error - No output associated with surface %p.\n",
+				surface);
+		return IAS_HMI_FCAP_ERROR_INVALID;
+	}
+
+	wl_list_for_each(capture_item, &ias_backend->capture_proxy_list, link) {
+		if (capture_item->capture_surface == surface) {
+			/* Remove the old output's link from capture_vsync_listener */
+			wl_list_remove(&capture_item->capture_vsync_listener.link);
+
+			/* Add the new output's link into capture_vsync_listener */
+			capture_item->capture_vsync_listener.notify = capture_vsync_notify;
+			wl_signal_add(&output->next_scanout_ready_signal,
+				&capture_item->capture_vsync_listener);
+		}
+	}
+
+	return IAS_HMI_FCAP_ERROR_OK;
+}
+
+#endif /*BUILD_REMOTE_DISPLAY*/
 
 static int
 init_drm(struct ias_backend *backend, struct udev_device *device)
@@ -4194,20 +4233,14 @@ create_gbm_device(int fd)
 
 	gbm = gbm_create_device(fd);
 
-#ifdef USE_VM
+#ifdef HYPER_DMABUF
 	gl_renderer->vm_exec = vm_exec;
 	gl_renderer->vm_dbg = vm_dbg;
-#ifdef HYPER_DMABUF
 	gl_renderer->vm_unexport_delay = vm_unexport_delay;
 	gl_renderer->vm_plugin_path = vm_plugin_path;
 	gl_renderer->vm_plugin_args = vm_plugin_args;
 	gl_renderer->vm_share_only = vm_share_only;
-#else
-	weston_log("Hyper dmabuf support not enabled during compilation, "
-		   "disabling surface sharing\n");
-	gl_renderer->vm_exec = 0;
-#endif // HYPER_DMABUF
-#endif // USE_VM
+#endif /* HYPER_DMABUF */
 
 	return gbm;
 }
@@ -4245,12 +4278,12 @@ ias_compositor_create_gl_renderer(struct ias_backend *backend)
 	int n_formats = 1;
 	int use_vm = 0;
 
-#ifdef USE_VM
+#ifdef HYPER_DMABUF
 	if(gl_renderer->vm_exec) {
 		backend->format = GBM_FORMAT_ARGB8888;
 	}
 	use_vm = gl_renderer->vm_exec;
-#endif // USE_VM
+#endif /* HYPER_DMABUF */
 
 	if (format[1])
 		n_formats = 2;
@@ -4486,7 +4519,7 @@ ias_compositor_create(struct weston_compositor *compositor,
 				MODIFIER_CTRL | MODIFIER_ALT,
 				switch_vt_binding, compositor);
 
-#ifdef BUILD_FRAME_CAPTURE
+#ifdef BUILD_REMOTE_DISPLAY
 	wl_list_init(&backend->capture_proxy_list);
 #endif
 
@@ -4565,10 +4598,11 @@ ias_compositor_create(struct weston_compositor *compositor,
 	backend->get_tex_info = get_tex_info;
 	backend->get_egl_image_info = get_egl_image_info;
 	backend->set_viewport = set_viewport;
-#ifdef BUILD_FRAME_CAPTURE
+#ifdef BUILD_REMOTE_DISPLAY
 	backend->start_capture = start_capture;
 	backend->stop_capture = stop_capture;
 	backend->release_buffer_handle = release_buffer_handle;
+	backend->change_capture_output = change_capture_output;
 #endif
 
 	centre_pointer(backend);
@@ -5562,9 +5596,7 @@ void env_begin(void *userdata, const char **attrs)
  */
 void capture_begin(void *userdata, const char **attrs)
 {
-#ifdef BUILD_FRAME_CAPTURE
-	/* Nothing to do here. */
-#else
+#ifndef BUILD_REMOTE_DISPLAY
 	weston_log("warning: frame capture options set in " CFG_FILENAME
 			" but frame capture not compiled in\n");
 #endif

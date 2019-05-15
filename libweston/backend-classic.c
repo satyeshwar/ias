@@ -385,7 +385,7 @@ generate_crtc_scanout_classic(struct ias_crtc *ias_crtc,
 				return 0;
 			}
 
-#if defined(BUILD_VAAPI_RECORDER) || defined(BUILD_FRAME_CAPTURE)
+#if defined(BUILD_VAAPI_RECORDER) || defined(BUILD_REMOTE_DISPLAY)
 			wl_signal_emit(&output->next_scanout_ready_signal, output);
 #endif
 		}
@@ -552,7 +552,7 @@ allocate_scanout_classic(struct ias_crtc *ias_crtc, struct ias_mode *m)
 		IAS_ERROR("Failed to create scanout for CRTC");
 		goto try_revert_mode;
 	}
-#ifdef USE_VM
+#ifdef HYPER_DMABUF
 	use_vm = gl_renderer->vm_exec;
 #endif
 
@@ -642,6 +642,10 @@ flip_handler_classic(struct ias_crtc *ias_crtc,
 	uint32_t flags = WP_PRESENTATION_FEEDBACK_KIND_VSYNC |
 			WP_PRESENTATION_FEEDBACK_KIND_HW_COMPLETION |
 			WP_PRESENTATION_FEEDBACK_KIND_HW_CLOCK;
+	struct ias_output *ias_output = ias_crtc->output[0];
+
+	/* Increment the flip count for this output */
+	ias_output->flip_count++;
 
 	/* If obj_id == 0, then legacy pageflip code is being used */
 	if ((obj_id == ias_crtc->crtc_id) || (obj_id == 0)) {

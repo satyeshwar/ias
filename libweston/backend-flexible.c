@@ -411,7 +411,7 @@ generate_crtc_scanout_flexible(struct ias_crtc *ias_crtc,
 				return 0;
 			}
 
-#if defined(BUILD_VAAPI_RECORDER) || defined(BUILD_FRAME_CAPTURE)
+#if defined(BUILD_VAAPI_RECORDER) || defined(BUILD_REMOTE_DISPLAY)
 			wl_signal_emit(&output->next_scanout_ready_signal, output);
 #endif
 		}
@@ -559,9 +559,9 @@ allocate_scanout_flexible(struct ias_crtc *ias_crtc, struct ias_mode *m)
 			return -1;
 		}
 
-#ifdef USE_VM
+#ifdef HYPER_DMABUF
 		use_vm = gl_renderer->vm_exec;
-#endif // USE_VM
+#endif /* HYPER_DMABUF */
 
 		if (gl_renderer->output_window_create(&ias_crtc->output[i]->base,
 						      (EGLNativeWindowType)scanout[i].surface,
@@ -900,7 +900,7 @@ flip_handler_flexible(struct ias_crtc *ias_crtc,
 			priv->commited &= ~(1<<s);
 
 			wl_signal_emit(&ias_crtc->output[s]->printfps_signal, ias_crtc->output[s]);
-
+			ias_crtc->output[s]->flip_count++;
 
 			if (ias_crtc->backend->no_flip_event) {
 				ias_crtc->output[s]->base.repaint_status = REPAINT_NOT_SCHEDULED;

@@ -14,7 +14,7 @@ BUILT_SOURCES = plugins
 exampledir = $(bindir)/../share/ias/examples
 example_PROGRAMS =
 
-AM_DISTCHECK_CONFIGURE_FLAGS = --disable-setuid-install
+AM_DISTCHECK_CONFIGURE_FLAGS = --disable-setuid-install --enable-autotools
 
 EXTRA_DIST = weston.ini.in ivi-shell/weston.ini.in
 
@@ -28,10 +28,8 @@ weston.ini : $(srcdir)/weston.ini.in
 ivi-shell/weston.ini : $(srcdir)/ivi-shell/weston.ini.in
 	$(AM_V_GEN)$(MKDIR_P) $(dir $@) && $(SED) \
 		-e 's|@bindir[@]|$(bindir)|g' \
-		-e 's|@abs_top_builddir[@]|$(abs_top_builddir)|g' \
-		-e 's|@abs_top_srcdir[@]|$(abs_top_srcdir)|g' \
 		-e 's|@libexecdir[@]|$(libexecdir)|g' \
-		-e 's|@plugin_prefix[@]||g' \
+		-e 's|@westondatadir[@]|$(westondatadir)|g' \
 		$< > $@
 
 all-local : weston.ini ivi-shell/weston.ini
@@ -63,7 +61,7 @@ CLEANFILES = weston.ini				\
 install-libweston_moduleLTLIBRARIES install-moduleLTLIBRARIES: install-libLTLIBRARIES
 
 lib_LTLIBRARIES = libias-@LIBWESTON_MAJOR@.la
-libias_@LIBWESTON_MAJOR@_la_CPPFLAGS = $(AM_CPPFLAGS) -DIN_WESTON
+libias_@LIBWESTON_MAJOR@_la_CPPFLAGS = $(AM_CPPFLAGS)
 libias_@LIBWESTON_MAJOR@_la_CFLAGS = $(AM_CFLAGS) \
 	$(COMPOSITOR_CFLAGS) $(EGL_CFLAGS) $(LIBDRM_CFLAGS)
 libias_@LIBWESTON_MAJOR@_la_LIBADD = $(COMPOSITOR_LIBS) \
@@ -85,6 +83,7 @@ libias_@LIBWESTON_MAJOR@_la_SOURCES =			\
 	libweston/input.c				\
 	libweston/data-device.c				\
 	libweston/screenshooter.c			\
+	libweston/touch-calibration.c			\
 	libweston/clipboard.c				\
 	libweston/zoom.c				\
 	libweston/bindings.c				\
@@ -99,8 +98,15 @@ libias_@LIBWESTON_MAJOR@_la_SOURCES =			\
 	libweston/timeline-object.h			\
 	libweston/linux-dmabuf.c			\
 	libweston/linux-dmabuf.h			\
+	libweston/linux-explicit-synchronization.c	\
+	libweston/linux-explicit-synchronization.h	\
+	libweston/linux-sync-file.c			\
+	libweston/linux-sync-file.h			\
 	libweston/pixel-formats.c			\
 	libweston/pixel-formats.h			\
+	libweston/weston-debug.c			\
+	libweston/weston-debug.h			\
+	shared/fd-util.h				\
 	shared/helpers.h				\
 	shared/matrix.c					\
 	shared/matrix.h					\
@@ -109,8 +115,12 @@ libias_@LIBWESTON_MAJOR@_la_SOURCES =			\
 	shared/platform.h				\
 	shared/weston-egl-ext.h
 
+libias_@LIBWESTON_MAJOR@_datadir = $(datadir)/weston/protocols
+dist_libias_@LIBWESTON_MAJOR@_data_DATA =	\
+	protocol/weston-debug.xml
+
 lib_LTLIBRARIES += libias-desktop-@LIBWESTON_MAJOR@.la
-libias_desktop_@LIBWESTON_MAJOR@_la_CPPFLAGS = $(AM_CPPFLAGS) -DIN_WESTON
+libias_desktop_@LIBWESTON_MAJOR@_la_CPPFLAGS = $(AM_CPPFLAGS)
 libias_desktop_@LIBWESTON_MAJOR@_la_CFLAGS = $(AM_CFLAGS) $(COMPOSITOR_CFLAGS)
 libias_desktop_@LIBWESTON_MAJOR@_la_LIBADD =		\
 	libias-@LIBWESTON_MAJOR@.la			\
@@ -126,15 +136,19 @@ libias_desktop_@LIBWESTON_MAJOR@_la_SOURCES =	\
 	libweston-desktop/surface.c			\
 	libweston-desktop/wl-shell.c			\
 	libweston-desktop/xdg-shell-v6.c		\
+	libweston-desktop/xdg-shell.c			\
 	libweston-desktop/xwayland.c
 
 nodist_libias_desktop_@LIBWESTON_MAJOR@_la_SOURCES =		\
 	protocol/xdg-shell-unstable-v6-protocol.c		\
-	protocol/xdg-shell-unstable-v6-server-protocol.h
+	protocol/xdg-shell-unstable-v6-server-protocol.h	\
+	protocol/xdg-shell-protocol.c				\
+	protocol/xdg-shell-server-protocol.h
 
 BUILT_SOURCES += $(nodist_libias_desktop_@LIBWESTON_MAJOR@_la_SOURCES)
 
 libias-desktop-@LIBWESTON_MAJOR@.la libweston-desktop/libias_desktop_@LIBWESTON_MAJOR@_la-xdg-shell-v6.lo: protocol/xdg-shell-unstable-v6-server-protocol.h
+libias-desktop-@LIBWESTON_MAJOR@.la libweston-desktop/libias_desktop_@LIBWESTON_MAJOR@_la-xdg-wm-shell.lo: protocol/xdg-shell-server-protocol.h
 
 if SYSTEMD_NOTIFY_SUPPORT
 module_LTLIBRARIES += systemd-notify.la
@@ -155,6 +169,8 @@ endif
 nodist_libias_@LIBWESTON_MAJOR@_la_SOURCES =				\
 	protocol/weston-screenshooter-protocol.c			\
 	protocol/weston-screenshooter-server-protocol.h			\
+	protocol/weston-debug-protocol.c				\
+	protocol/weston-debug-server-protocol.h				\
 	protocol/text-cursor-position-protocol.c	\
 	protocol/text-cursor-position-server-protocol.h	\
 	protocol/text-input-unstable-v1-protocol.c			\
@@ -172,28 +188,37 @@ nodist_libias_@LIBWESTON_MAJOR@_la_SOURCES =				\
 	protocol/pointer-constraints-unstable-v1-protocol.c		\
 	protocol/pointer-constraints-unstable-v1-server-protocol.h      \
 	protocol/input-timestamps-unstable-v1-protocol.c		\
-	protocol/input-timestamps-unstable-v1-server-protocol.h
+	protocol/input-timestamps-unstable-v1-server-protocol.h		\
+	protocol/weston-touch-calibration-protocol.c			\
+	protocol/weston-touch-calibration-server-protocol.h		\
+	protocol/linux-explicit-synchronization-unstable-v1-protocol.c	\
+	protocol/linux-explicit-synchronization-unstable-v1-server-protocol.h
 
 BUILT_SOURCES += $(nodist_libias_@LIBWESTON_MAJOR@_la_SOURCES)
 
 bin_PROGRAMS += ias-weston
 
 ias_weston_LDFLAGS = -export-dynamic -pie
-ias_weston_CPPFLAGS = $(AM_CPPFLAGS) -DIN_WESTON 		\
-				 -DMODULEDIR='"$(moduledir)"' \
+ias_weston_CPPFLAGS = $(AM_CPPFLAGS) -DMODULEDIR='"$(moduledir)"' \
 				 -DXSERVER_PATH='"@XSERVER_PATH@"'
-ias_weston_CFLAGS = $(AM_CFLAGS) $(COMPOSITOR_CFLAGS) $(LIBINPUT_BACKEND_CFLAGS) -fPIE
+ias_weston_CFLAGS = $(AM_CFLAGS) $(COMPOSITOR_CFLAGS) $(LIBINPUT_BACKEND_CFLAGS) \
+					$(PTHREAD_CFLAGS) $(LIBEVDEV_CFLAGS) -fPIE
 ias_weston_LDADD = libshared.la libias-@LIBWESTON_MAJOR@.la \
 	$(COMPOSITOR_LIBS) \
 	$(DL_LIBS) $(LIBINPUT_BACKEND_LIBS) \
 	$(CLOCK_GETRES_LIBS) \
+	$(PTHREAD_LIBS) \
+	$(LIBEVDEV_LIBS) \
 	-lm
 
 ias_weston_SOURCES = 					\
 	compositor/main.c				\
 	compositor/weston-screenshooter.c		\
-	compositor/text-backend.c			\
+	compositor/text-backend.c
+if ENABLE_XWAYLAND
+ias_weston_SOURCES += 					\
 	compositor/xwayland.c
+endif
 
 # Track this dependency explicitly instead of using BUILT_SOURCES.  We
 # add BUILT_SOURCES to CLEANFILES, but we want to keep git-version.h
@@ -279,6 +304,10 @@ pkgconfig_DATA = \
 	libweston-desktop/libweston-desktop-${LIBWESTON_MAJOR}.pc \
 	compositor/weston.pc
 
+noarch_pkgconfigdir = $(datadir)/pkgconfig
+noarch_pkgconfig_DATA = \
+	libweston/libweston-${LIBWESTON_MAJOR}-protocols.pc
+
 wayland_sessiondir = $(datadir)/wayland-sessions
 dist_wayland_session_DATA = compositor/ias-weston.desktop
 
@@ -333,8 +362,10 @@ gl_renderer_la_SOURCES =			\
 	libweston/gl-renderer.c			\
 	libweston/vertex-clipping.c		\
 	libweston/vertex-clipping.h		\
-	libweston/weston-sync-file.h
-if ENABLE_VM
+	libweston/linux-sync-file.c		\
+	libweston/linux-sync-file.h		\
+	libweston/linux-sync-file-uapi.h
+if ENABLE_HYPER_DMABUF
 gl_renderer_la_SOURCES +=			\
 	libweston/vm-shared.h				\
 	libweston/vm.h				\
@@ -416,6 +447,23 @@ drm_backend_la_LIBADD += $(LIBVA_LIBS)
 drm_backend_la_LDFLAGS += -pthread
 drm_backend_la_CFLAGS += $(LIBVA_CFLAGS)
 endif
+
+# remoting
+if ENABLE_REMOTING
+libweston_module_LTLIBRARIES += remoting-plugin.la
+remoting_plugin_la_LDFLAGS = -module -avoid-version
+remoting_plugin_la_LIBADD =			\
+	$(COMPOSITOR_LIBS)			\
+	$(REMOTING_GST_LIBS)
+remoting_plugin_la_CFLAGS =			\
+	$(COMPOSITOR_CFLAGS)			\
+	$(REMOTING_GST_CFLAGS)			\
+	$(AM_CFLAGS)
+remoting_plugin_la_SOURCES =			\
+	remoting/remoting-plugin.c		\
+	remoting/remoting-plugin.h
+endif
+
 endif
 
 if ENABLE_IAS_COMPOSITOR
@@ -447,7 +495,7 @@ ias_backend_la_SOURCES =                       \
        libweston/ias-backend.h						\
        libweston/backend-classic.c					\
        libweston/backend-flexible.c
-if ENABLE_FRAME_CAPTURE
+if ENABLE_REMOTE_DISPLAY
 ias_backend_la_SOURCES +=  \
        libweston/capture-proxy.c						\
        libweston/capture-proxy.h						\
@@ -481,8 +529,8 @@ wayland_backend_la_SOURCES = 					\
 nodist_wayland_backend_la_SOURCES =				\
 	protocol/fullscreen-shell-unstable-v1-protocol.c	\
 	protocol/fullscreen-shell-unstable-v1-client-protocol.h	\
-	protocol/xdg-shell-unstable-v6-protocol.c		\
-	protocol/xdg-shell-unstable-v6-client-protocol.h
+	protocol/xdg-shell-protocol.c				\
+	protocol/xdg-shell-client-protocol.h
 endif
 
 if ENABLE_HEADLESS_COMPOSITOR
@@ -708,7 +756,7 @@ transport_plugin_udp_la_SOURCES = clients/RemoteDisplay/transport_plugin_udp.c
 
 endif
 
-if ENABLE_VMDISPLAY
+if ENABLE_HYPER_DMABUF
 noinst_LTLIBRARIES += libvmdisplay.la
 
 libvmdisplay_la_LIBADD = $(COMPOSITOR_LIBS)	\
@@ -725,6 +773,7 @@ libvmdisplay_la_SOURCES = clients/vmdisplay/vmdisplay-parser.c \
 		clients/vmdisplay/vmdisplay.c		\
 		clients/vmdisplay/wayland-drm-protocol.c
 
+bin_PROGRAMS += vmdisplay-wayland
 vmdisplay_wayland_SOURCES =	clients/vmdisplay/vmdisplay-wayland.c
 nodist_vmdisplay_wayland_SOURCES =				\
 	protocol/ias-shell-server-protocol.h    \
@@ -737,6 +786,7 @@ vmdisplay_wayland_LDADD = $(COMPOSITOR_LIBS) $(GLIB_LIBS) $(EGL_LIBS) $(SIMPLE_C
 	$(SIMPLE_EGL_CLIENT_LIBS)               \
 	libias-@LIBWESTON_MAJOR@.la
 
+bin_PROGRAMS += vmdisplay-server
 vmdisplay_server_SOURCES = clients/vmdisplay/vmdisplay-server.cpp	\
 		clients/vmdisplay/vmdisplay-server-network.cpp		\
 		clients/vmdisplay/vmdisplay-server-hyperdmabuf.cpp
@@ -744,6 +794,7 @@ vmdisplay_server_CFLAGS = $(AM_CFLAGS) $(GCC_CFLAGS)
 vmdisplay_server_LDADD =  $(GLIB_LIBS) \
 	libshared.la libvmdisplay.la -lm -lpthread
 
+bin_PROGRAMS += vmdisplay-input
 vmdisplay_input_SOURCES = clients/vmdisplay/vmdisplay-input.cpp
 nodist_vmdisplay_input_SOURCES = clients/vmdisplay/vmdisplay-server-network.cpp
 vmdisplay_input_CFLAGS = $(AM_CFLAGS) $(GCC_CFLAGS)
@@ -906,11 +957,10 @@ thumbnail_layout_la_LDFLAGS = -module -L$(WLD)/lib
 
 if BUILD_CLIENTS
 
-example_PROGRAMS += weston-terminal weston-info
+example_PROGRAMS += weston-terminal weston-info weston-debug weston-screenshooter
 
 libexec_PROGRAMS +=				\
 	weston-desktop-shell			\
-	weston-screenshooter			\
 	weston-keyboard				\
 	weston-simple-im			\
 	ias-test-hmi
@@ -919,7 +969,7 @@ if ENABLE_IVI_SHELL
 libexec_PROGRAMS +=				\
 	weston-ivi-shell-user-interface
 endif
-if ENABLE_VMDISPLAY
+if ENABLE_HYPER_DMABUF
 libexec_PROGRAMS += vmdisplay-wayland		\
 	vmdisplay-server			\
 	vmdisplay-input
@@ -939,6 +989,7 @@ demo_clients =					\
 	weston-fullscreen			\
 	weston-stacking				\
 	weston-calibrator			\
+	weston-touch-calibrator			\
 	weston-scaler				\
 	weston-simple-clock
 
@@ -965,19 +1016,18 @@ demo_clients +=					\
 if ENABLE_REMOTE_DISPLAY
 demo_clients += \
 	remote-display \
-	mediaplayer
+	mediaplayer \
+	remote-display-show
 endif
 
 weston_simple_shm_SOURCES = clients/simple-shm.c
 nodist_weston_simple_shm_SOURCES =		\
-	protocol/xdg-shell-unstable-v6-protocol.c		\
-	protocol/xdg-shell-unstable-v6-client-protocol.h	\
+	protocol/xdg-shell-protocol.c		\
+	protocol/xdg-shell-client-protocol.h	\
 	protocol/ias-shell-protocol.c		\
 	protocol/ias-shell-client-protocol.h		\
 	protocol/fullscreen-shell-unstable-v1-protocol.c	\
-	protocol/fullscreen-shell-unstable-v1-client-protocol.h	\
-	protocol/ivi-application-protocol.c		\
-	protocol/ivi-application-client-protocol.h
+	protocol/fullscreen-shell-unstable-v1-client-protocol.h	
 weston_simple_shm_CFLAGS = $(AM_CFLAGS) $(SIMPLE_CLIENT_CFLAGS) -fPIE
 weston_simple_shm_LDADD = $(SIMPLE_CLIENT_LIBS) libshared.la
 weston_simple_shm_LDFLAGS = -pie
@@ -986,8 +1036,8 @@ weston_simple_damage_SOURCES = clients/simple-damage.c
 nodist_weston_simple_damage_SOURCES =		\
 	protocol/viewporter-protocol.c		\
 	protocol/viewporter-client-protocol.h	\
-	protocol/xdg-shell-unstable-v6-protocol.c		\
-	protocol/xdg-shell-unstable-v6-client-protocol.h	\
+	protocol/xdg-shell-protocol.c		\
+	protocol/xdg-shell-client-protocol.h	\
 	protocol/fullscreen-shell-unstable-v1-protocol.c	\
 	protocol/fullscreen-shell-unstable-v1-client-protocol.h
 weston_simple_damage_CFLAGS = $(AM_CFLAGS) $(SIMPLE_CLIENT_CFLAGS) -fPIE
@@ -999,9 +1049,7 @@ weston_simple_touch_SOURCES = 			\
 	shared/helpers.h
 nodist_weston_simple_touch_SOURCES =			\
 	protocol/ias-shell-protocol.c			\
-	protocol/ias-shell-client-protocol.h 		\
-	protocol/ivi-application-protocol.c             \
-	protocol/ivi-application-client-protocol.h
+	protocol/ias-shell-client-protocol.h
 weston_simple_touch_CFLAGS = $(AM_CFLAGS) $(SIMPLE_CLIENT_CFLAGS) -fPIE
 weston_simple_touch_LDADD = $(SIMPLE_CLIENT_LIBS) libshared.la
 weston_simple_touch_LDFLAGS = -pie
@@ -1069,6 +1117,16 @@ nodist_remote_display_SOURCES =		\
 remote_display_CFLAGS = $(AM_CFLAGS) $(SIMPLE_CLIENT_CFLAGS) $(LIBVA_CFLAGS)
 remote_display_LDADD = $(LIBDRM_LIBS) $(SIMPLE_CLIENT_LIBS) $(LIBVA_LIBS) libshared.la -lm -ldrm_intel -ldl -lpthread
 
+remote_display_show_SOURCES = \
+	clients/RemoteDisplay/remote-display-show.c
+nodist_remote_display_show_SOURCES = \
+	protocol/ias-shell-protocol.c \
+	protocol/ias-shell-server-protocol.h \
+	protocol/ivi-application-protocol.c \
+	protocol/ivi-application-client-protocol.h
+remote_display_show_CFLAGS = $(AM_CFLAGS) $(SIMPLE_CLIENT_CFLAGS)
+remote_display_show_LDADD = $(LIBDRM_LIBS) $(SIMPLE_EGL_CLIENT_LIBS) libshared.la -lm -ldrm_intel -ldl -lpthread
+
 mediaplayer_SOURCES = 		\
 	clients/mediaplayer.c
 mediaplayer_CFLAGS = $(AM_CFLAGS) $(SIMPLE_CLIENT_CFLAGS) -I/usr/include/glib-2.0 \
@@ -1108,10 +1166,8 @@ if BUILD_SIMPLE_EGL_CLIENTS
 demo_clients += weston-simple-egl
 weston_simple_egl_SOURCES = clients/simple-egl.c
 nodist_weston_simple_egl_SOURCES =		\
-	protocol/xdg-shell-unstable-v6-protocol.c		\
-	protocol/xdg-shell-unstable-v6-client-protocol.h	\
-	protocol/ivi-application-protocol.c		\
-	protocol/ivi-application-client-protocol.h	\
+	protocol/xdg-shell-protocol.c		\
+	protocol/xdg-shell-client-protocol.h \
 	protocol/ias-shell-protocol.c		\
 	protocol/ias-shell-client-protocol.h
 weston_simple_egl_CFLAGS = $(AM_CFLAGS) $(SIMPLE_EGL_CLIENT_CFLAGS) -fPIE
@@ -1121,10 +1177,8 @@ weston_simple_egl_LDFLAGS = -pie
 demo_clients += weston-simple-egl-ms
 weston_simple_egl_ms_SOURCES = clients/simple-egl-ms.c
 nodist_weston_simple_egl_ms_SOURCES =		\
-	protocol/xdg-shell-unstable-v6-protocol.c		\
-	protocol/xdg-shell-unstable-v6-client-protocol.h	\
-	protocol/ivi-application-protocol.c		\
-	protocol/ivi-application-client-protocol.h	\
+	protocol/xdg-shell-protocol.c		\
+	protocol/xdg-shell-client-protocol.h	\
 	protocol/ias-shell-protocol.c		\
 	protocol/ias-shell-client-protocol.h
 weston_simple_egl_ms_CFLAGS = $(AM_CFLAGS) $(SIMPLE_EGL_CLIENT_CFLAGS) -fPIE
@@ -1164,8 +1218,8 @@ weston_simple_dmabuf_drm_SOURCES =			\
 	clients/simple-dmabuf-drm.c			\
 	clients/simple-dmabuf-drm-data.h
 nodist_weston_simple_dmabuf_drm_SOURCES =		\
-	protocol/xdg-shell-unstable-v6-protocol.c		\
-	protocol/xdg-shell-unstable-v6-client-protocol.h	\
+	protocol/xdg-shell-protocol.c			\
+	protocol/xdg-shell-client-protocol.h		\
 	protocol/fullscreen-shell-unstable-v1-protocol.c	\
 	protocol/fullscreen-shell-unstable-v1-client-protocol.h \
 	protocol/linux-dmabuf-unstable-v1-protocol.c \
@@ -1173,6 +1227,7 @@ nodist_weston_simple_dmabuf_drm_SOURCES =		\
 weston_simple_dmabuf_drm_CFLAGS = $(AM_CFLAGS) $(SIMPLE_DMABUF_DRM_CLIENT_CFLAGS) -fPIE
 weston_simple_dmabuf_drm_LDADD = $(SIMPLE_DMABUF_DRM_CLIENT_LIBS) \
 	$(LIBDRM_PLATFORM_FREEDRENO_LIBS) \
+	$(LIBDRM_PLATFORM_ETNAVIV_LIBS)   \
 	$(LIBDRM_PLATFORM_INTEL_LIBS)     \
 	libshared.la
 weston_simple_dmabuf_drm_LDFLAGS = -pie
@@ -1182,8 +1237,8 @@ if BUILD_SIMPLE_DMABUF_V4L_CLIENT
 demo_clients += weston-simple-dmabuf-v4l
 weston_simple_dmabuf_v4l_SOURCES = clients/simple-dmabuf-v4l.c
 nodist_weston_simple_dmabuf_v4l_SOURCES =		\
-	protocol/xdg-shell-unstable-v6-protocol.c		\
-	protocol/xdg-shell-unstable-v6-client-protocol.h	\
+	protocol/xdg-shell-protocol.c			\
+	protocol/xdg-shell-client-protocol.h		\
 	protocol/fullscreen-shell-unstable-v1-protocol.c	\
 	protocol/fullscreen-shell-unstable-v1-client-protocol.h \
 	protocol/linux-dmabuf-unstable-v1-protocol.c \
@@ -1204,10 +1259,8 @@ nodist_libwl_base_la_SOURCES = \
 	protocol/ias-backend-protocol.c			\
 	protocol/ias-shell-protocol.c			\
 	protocol/ias-shell-client-protocol.h	\
-	protocol/xdg-shell-unstable-v6-protocol.c			\
-	protocol/xdg-shell-unstable-v6-client-protocol.h		\
-	protocol/ivi-application-protocol.c		\
-	protocol/ivi-application-client-protocol.h
+	protocol/xdg-shell-protocol.c		\
+	protocol/xdg-shell-client-protocol.h
 
 BUILT_SOURCES += $(nodist_libwl_base_la_SOURCES)
 
@@ -1222,7 +1275,11 @@ module_LTLIBRARIES += libwl_disp.la
 
 libwl_disp_la_SOURCES =				\
 	clients/wl_disp/display_wayland.cpp		\
-	clients/wl_disp/display_wayland.h
+	clients/wl_disp/display_wayland.h	\
+	protocol/ias-shell-protocol.c			\
+	protocol/ias-shell-client-protocol.h	\
+	protocol/xdg-shell-protocol.c		\
+	protocol/xdg-shell-client-protocol.h
 
 libwl_disp_la_LDFLAGS = -module -avoid-version
 libwl_disp_la_LIBADD =  $(GLIB_LIBS)		\
@@ -1238,7 +1295,9 @@ module_LTLIBRARIES += libias_hmi.la
 
 libias_hmi_la_SOURCES =				\
 	clients/ias_hmi/ias_hmi_reg.cpp		\
-	clients/ias_hmi/ias_hmi_reg.h
+	clients/ias_hmi/ias_hmi_reg.h		\
+	protocol/ias-shell-protocol.c		\
+	protocol/ias-shell-client-protocol.h
 
 libias_hmi_la_LDFLAGS = -module -avoid-version
 libias_hmi_la_LIBADD =  $(GLIB_LIBS)		\
@@ -1249,6 +1308,22 @@ libias_hmi_la_CPPFLAGS = $(GCC_CFLAGS)		\
 			$(GLIB_CFLAGS)		\
 			$(AM_CFLAGS) -I$(top_srcdir)/clients/wl_disp -I$(top_srcdir)/clients/wl_base \
 			-fPIC -fvisibility=default
+
+if BUILD_SIMPLE_DMABUF_EGL_CLIENT
+demo_clients += weston-simple-dmabuf-egl
+weston_simple_dmabuf_egl_SOURCES = clients/simple-dmabuf-egl.c
+nodist_weston_simple_dmabuf_egl_SOURCES =		\
+	protocol/xdg-shell-unstable-v6-protocol.c		\
+	protocol/xdg-shell-unstable-v6-client-protocol.h	\
+	protocol/fullscreen-shell-unstable-v1-protocol.c	\
+	protocol/fullscreen-shell-unstable-v1-client-protocol.h \
+	protocol/linux-dmabuf-unstable-v1-protocol.c \
+	protocol/linux-dmabuf-unstable-v1-client-protocol.h	\
+	protocol/linux-explicit-synchronization-unstable-v1-protocol.c	\
+	protocol/linux-explicit-synchronization-unstable-v1-client-protocol.h
+weston_simple_dmabuf_egl_CFLAGS = $(AM_CFLAGS) $(SIMPLE_DMABUF_EGL_CLIENT_CFLAGS)
+weston_simple_dmabuf_egl_LDADD = $(SIMPLE_DMABUF_EGL_CLIENT_LIBS) libshared.la -lm
+endif
 
 noinst_LTLIBRARIES += libtoytoolkit.la
 
@@ -1268,10 +1343,8 @@ nodist_libtoytoolkit_la_SOURCES =			\
 	protocol/ias-shell-client-protocol.h	\
 	protocol/viewporter-protocol.c			\
 	protocol/viewporter-client-protocol.h		\
-	protocol/xdg-shell-unstable-v6-protocol.c			\
-	protocol/xdg-shell-unstable-v6-client-protocol.h		\
-	protocol/ivi-application-protocol.c		\
-	protocol/ivi-application-client-protocol.h	\
+	protocol/xdg-shell-protocol.c			\
+	protocol/xdg-shell-client-protocol.h		\
 	protocol/pointer-constraints-unstable-v1-protocol.c		\
 	protocol/pointer-constraints-unstable-v1-client-protocol.h	\
 	protocol/relative-pointer-unstable-v1-protocol.c		\
@@ -1408,6 +1481,17 @@ weston_calibrator_LDADD = libtoytoolkit.la
 weston_calibrator_CFLAGS = $(AM_CFLAGS) $(CLIENT_CFLAGS) -fPIE
 weston_calibrator_LDFLAGS = -pie
 
+weston_touch_calibrator_SOURCES = 			\
+	clients/touch-calibrator.c			\
+	shared/helpers.h				\
+	shared/matrix.c					\
+	shared/matrix.h
+nodist_weston_touch_calibrator_SOURCES =		\
+	protocol/weston-touch-calibration-protocol.c	\
+	protocol/weston-touch-calibration-client-protocol.h
+weston_touch_calibrator_LDADD = libtoytoolkit.la
+weston_touch_calibrator_CFLAGS = $(AM_CFLAGS) $(CLIENT_CFLAGS)
+
 if BUILD_SUBSURFACES_CLIENT
 demo_clients += weston-subsurfaces
 weston_subsurfaces_SOURCES = 			\
@@ -1464,14 +1548,27 @@ ias_test_hmi_LDFLAGS = -pie
 weston_info_SOURCES = 					\
 	clients/weston-info.c				\
 	shared/helpers.h
-nodist_weston_info_SOURCES =				\
-	protocol/presentation-time-protocol.c		\
-	protocol/presentation-time-client-protocol.h	\
-	protocol/linux-dmabuf-unstable-v1-protocol.c	\
-	protocol/linux-dmabuf-unstable-v1-client-protocol.h
+nodist_weston_info_SOURCES =					\
+	protocol/presentation-time-protocol.c			\
+	protocol/presentation-time-client-protocol.h		\
+	protocol/linux-dmabuf-unstable-v1-protocol.c		\
+	protocol/linux-dmabuf-unstable-v1-client-protocol.h	\
+	protocol/tablet-unstable-v2-protocol.c			\
+	protocol/tablet-unstable-v2-client-protocol.h		\
+	protocol/xdg-output-unstable-v1-protocol.c		\
+	protocol/xdg-output-unstable-v1-client-protocol.h
 weston_info_LDADD = $(WESTON_INFO_LIBS) libshared.la
 weston_info_CFLAGS = $(AM_CFLAGS) $(CLIENT_CFLAGS) -fPIE
 weston_info_LDFLAGS = -pie
+
+weston_debug_SOURCES = 					\
+	clients/weston-debug.c				\
+	shared/helpers.h
+nodist_weston_debug_SOURCES =				\
+	protocol/weston-debug-protocol.c		\
+	protocol/weston-debug-client-protocol.h
+weston_debug_LDADD = $(WESTON_INFO_LIBS) libshared.la
+weston_debug_CFLAGS = $(AM_CFLAGS) $(CLIENT_CFLAGS)
 
 weston_desktop_shell_SOURCES = 				\
 	clients/desktop-shell.c				\
@@ -1512,6 +1609,10 @@ BUILT_SOURCES +=					\
 	protocol/ias-backend-client-protocol.h		\
 	protocol/weston-screenshooter-protocol.c			\
 	protocol/weston-screenshooter-client-protocol.h			\
+	protocol/weston-touch-calibration-protocol.c			\
+	protocol/weston-touch-calibration-client-protocol.h		\
+	protocol/weston-debug-protocol.c				\
+	protocol/weston-debug-client-protocol.h				\
 	protocol/ias-backend-protocol.c				\
 	protocol/ias-shell-server-protocol.h	\
 	protocol/ias-shell-protocol.c		\
@@ -1535,6 +1636,8 @@ BUILT_SOURCES +=					\
 	protocol/fullscreen-shell-unstable-v1-client-protocol.h	\
 	protocol/xdg-shell-unstable-v6-protocol.c			\
 	protocol/xdg-shell-unstable-v6-client-protocol.h		\
+	protocol/xdg-shell-protocol.c					\
+	protocol/xdg-shell-client-protocol.h				\
 	protocol/trace-reporter-protocol.c		\
 	protocol/trace-reporter-client-protocol.h	\
 	protocol/ivi-hmi-controller-protocol.c		\
@@ -1543,8 +1646,14 @@ BUILT_SOURCES +=					\
 	protocol/ivi-application-client-protocol.h	\
 	protocol/linux-dmabuf-unstable-v1-protocol.c	\
 	protocol/linux-dmabuf-unstable-v1-client-protocol.h		\
+	protocol/tablet-unstable-v2-protocol.c		\
+	protocol/tablet-unstable-v2-client-protocol.h			\
 	protocol/input-timestamps-unstable-v1-protocol.c		\
-	protocol/input-timestamps-unstable-v1-client-protocol.h
+	protocol/input-timestamps-unstable-v1-client-protocol.h		\
+	protocol/xdg-output-unstable-v1-protocol.c			\
+	protocol/xdg-output-unstable-v1-client-protocol.h		\
+	protocol/linux-explicit-synchronization-unstable-v1-protocol.c	\
+	protocol/linux-explicit-synchronization-unstable-v1-client-protocol.h
 
 westondatadir = $(datadir)/ias
 dist_westondata_DATA =				\
@@ -1604,8 +1713,7 @@ desktop_shell_la_CPPFLAGS =			\
 	-I$(top_srcdir)/libweston		\
 	-I$(top_builddir)/desktop-shell		\
 	-DMODULEDIR='"$(moduledir)"'		\
-	-DLIBEXECDIR='"$(libexecdir)"'		\
-	-DIN_WESTON
+	-DLIBEXECDIR='"$(libexecdir)"'
 
 desktop_shell_la_LDFLAGS = -module -avoid-version
 desktop_shell_la_LIBADD = libshared.la libias-desktop-@LIBWESTON_MAJOR@.la $(COMPOSITOR_LIBS)
@@ -1631,8 +1739,7 @@ fullscreen_shell_la_CPPFLAGS =			\
 	-I$(top_builddir)/protocol		\
 	-I$(top_srcdir)/shared			\
 	-I$(top_builddir)/libweston		\
-	-I$(top_srcdir)/libweston		\
-	-DIN_WESTON
+	-I$(top_srcdir)/libweston
 
 fullscreen_shell_la_LDFLAGS = -module -avoid-version
 fullscreen_shell_la_LIBADD =			\
@@ -1665,6 +1772,7 @@ ivi_shell_la_LDFLAGS = -module -avoid-version
 ivi_shell_la_LIBADD =				\
 	libshared.la				\
 	libias-@LIBWESTON_MAJOR@.la		\
+	libias-desktop-@LIBWESTON_MAJOR@.la  \
 	$(COMPOSITOR_LIBS)
 ivi_shell_la_CFLAGS = $(AM_CFLAGS) $(COMPOSITOR_CFLAGS)
 ivi_shell_la_SOURCES =				\
@@ -1675,7 +1783,6 @@ ivi_shell_la_SOURCES =				\
 	ivi-shell/ivi-layout-transition.c	\
 	ivi-shell/ivi-shell.h			\
 	ivi-shell/ivi-shell.c			\
-	ivi-shell/input-panel-ivi.c		\
 	shared/helpers.h
 nodist_ivi_shell_la_SOURCES =			\
 	protocol/ivi-application-protocol.c		\
@@ -1894,7 +2001,8 @@ weston_tests =					\
 	subsurface.weston			\
 	subsurface-shot.weston			\
 	devices.weston				\
-	touch.weston
+	touch.weston				\
+	linux-explicit-synchronization.weston
 
 AM_TESTS_ENVIRONMENT = \
 	abs_builddir='$(abs_builddir)'; export abs_builddir; \
@@ -1962,11 +2070,6 @@ weston_test_desktop_shell_la_CFLAGS = $(AM_CFLAGS) $(COMPOSITOR_CFLAGS)
 weston_test_desktop_shell_la_SOURCES = 			\
 	tests/weston-test-desktop-shell.c		\
 	shared/helpers.h
-
-if ENABLE_EGL
-weston_test_la_CFLAGS += $(EGL_TESTS_CFLAGS)
-weston_test_la_LDFLAGS += $(EGL_TESTS_LIBS)
-endif
 
 libtest_runner_la_SOURCES =			\
 	tests/weston-test-runner.c		\
@@ -2093,6 +2196,14 @@ touch_weston_SOURCES = tests/touch-test.c
 touch_weston_CFLAGS = $(AM_CFLAGS) $(TEST_CLIENT_CFLAGS)
 touch_weston_LDADD = libtest-client.la
 
+linux_explicit_synchronization_weston_SOURCES = \
+	tests/linux-explicit-synchronization-test.c
+nodist_linux_explicit_synchronization_weston_SOURCES = \
+	protocol/linux-explicit-synchronization-unstable-v1-protocol.c	\
+	protocol/linux-explicit-synchronization-unstable-v1-client-protocol.h
+linux_explicit_synchronization_weston_CFLAGS = $(AM_CFLAGS) $(TEST_CLIENT_CFLAGS)
+linux_explicit_synchronization_weston_LDADD = libtest-client.la
+
 if ENABLE_XWAYLAND_TEST
 weston_tests +=	xwayland-test.weston
 xwayland_test_weston_SOURCES = tests/xwayland-test.c
@@ -2117,13 +2228,13 @@ ivi_layout_internal_test_la_LIBADD = $(test_module_libadd)
 ivi_layout_internal_test_la_LDFLAGS = $(test_module_ldflags)
 ivi_layout_internal_test_la_CFLAGS = $(AM_CFLAGS) $(COMPOSITOR_CFLAGS)
 ivi_layout_internal_test_la_SOURCES =			\
-	tests/ivi_layout-internal-test.c
+	tests/ivi-layout-internal-test.c
 
 ivi_layout_test_la_LIBADD = $(test_module_libadd)
 ivi_layout_test_la_LDFLAGS = $(test_module_ldflags)
 ivi_layout_test_la_CFLAGS = $(AM_CFLAGS) $(COMPOSITOR_CFLAGS)
 ivi_layout_test_la_SOURCES =			\
-	tests/ivi_layout-test-plugin.c		\
+	tests/ivi-layout-test-plugin.c		\
 	tests/ivi-test.h			\
 	shared/helpers.h
 nodist_ivi_layout_test_la_SOURCES =		\
@@ -2140,17 +2251,17 @@ nodist_ivi_shell_app_weston_SOURCES =		\
 ivi_shell_app_weston_CFLAGS = $(AM_CFLAGS) $(TEST_CLIENT_CFLAGS)
 ivi_shell_app_weston_LDADD = libtest-client.la
 
-noinst_PROGRAMS += ivi-layout.ivi
+noinst_PROGRAMS += ivi-layout-test-client.ivi
 
-ivi_layout_ivi_SOURCES =			\
-	tests/ivi_layout-test.c 		\
+ivi_layout_test_client_ivi_SOURCES =			\
+	tests/ivi-layout-test-client.c 		\
 	tests/ivi-test.h			\
 	shared/helpers.h
-nodist_ivi_layout_ivi_SOURCES = 		\
+nodist_ivi_layout_test_client_ivi_SOURCES = 		\
 	protocol/ivi-application-protocol.c	\
 	protocol/ivi-application-client-protocol.h
-ivi_layout_ivi_CFLAGS = $(AM_CFLAGS) $(TEST_CLIENT_CFLAGS)
-ivi_layout_ivi_LDADD = libtest-client.la
+ivi_layout_test_client_ivi_CFLAGS = $(AM_CFLAGS) $(TEST_CLIENT_CFLAGS)
+ivi_layout_test_client_ivi_LDADD = libtest-client.la
 endif
 
 if BUILD_SETBACKLIGHT
@@ -2203,6 +2314,7 @@ EXTRA_DIST +=					\
 	protocol/weston-screenshooter.xml	\
 	protocol/text-cursor-position.xml	\
 	protocol/weston-test.xml		\
+	protocol/weston-touch-calibration.xml	\
 	protocol/ias-backend.xml		\
 	protocol/ias-layout-manager.xml		\
 	protocol/ias-input-manager.xml		\
@@ -2220,14 +2332,14 @@ noinst_LTLIBRARIES +=				\
 surface_screenshot_la_LIBADD = libshared.la $(test_module_libadd)
 surface_screenshot_la_LDFLAGS = $(test_module_ldflags)
 surface_screenshot_la_CFLAGS = $(AM_CFLAGS) $(COMPOSITOR_CFLAGS)
-surface_screenshot_la_SOURCES = tests/surface-screenshot.c
+surface_screenshot_la_SOURCES = tests/surface-screenshot-test.c
 
 
 #
 # Documentation
 #
 
-man_MANS = weston.1 weston.ini.5
+man_MANS = weston.1 weston.ini.5 weston-debug.1
 
 if ENABLE_DRM_COMPOSITOR
 man_MANS += weston-drm.7
@@ -2238,10 +2350,14 @@ man_MANS += weston-rdp.7
 endif
 
 MAN_SUBSTS =								\
-	-e 's|__weston_native_backend__|$(WESTON_NATIVE_BACKEND)|g'	\
-	-e 's|__weston_modules_dir__|$(pkglibdir)|g'			\
-	-e 's|__weston_shell_client__|$(WESTON_SHELL_CLIENT)|g'		\
-	-e 's|__version__|$(PACKAGE_VERSION)|g'
+	-e 's|@weston_native_backend@|$(WESTON_NATIVE_BACKEND)|g'	\
+	-e 's|@weston_modules_dir@|$(moduledir)|g'			\
+	-e 's|@libweston_modules_dir@|$(libweston_moduledir)|g'	\
+	-e 's|@weston_shell_client@|$(WESTON_SHELL_CLIENT)|g'		\
+	-e 's|@weston_libexecdir@|$(libexecdir)|g' 			\
+	-e 's|@weston_bindir@|$(bindir)|g' 				\
+	-e 's|@xserver_path@|$(XSERVER_PATH)|g'			\
+	-e 's|@version@|$(PACKAGE_VERSION)|g'
 
 SUFFIXES = .1 .5 .7 .man
 
@@ -2249,7 +2365,12 @@ SUFFIXES = .1 .5 .7 .man
 	$(AM_V_GEN)$(SED) $(MAN_SUBSTS) < $< > $@
 
 EXTRA_DIST +=					\
+	CONTRIBUTING.md				\
+	README.md				\
+	doc/wayland-screenshot.jpg		\
+	doc/calibration-helper.bash		\
 	man/weston.man				\
+	man/weston-debug.man			\
 	man/weston-drm.man			\
 	man/weston-rdp.man			\
 	man/weston.ini.man
@@ -2304,3 +2425,23 @@ protocol/%-server-protocol.h : $(top_srcdir)/protocol/%.xml
 
 protocol/%-client-protocol.h : $(top_srcdir)/protocol/%.xml
 	$(AM_V_GEN)$(MKDIR_P) $(dir $@) && $(wayland_scanner) client-header < $< > $@
+
+EXTRA_DIST +=					\
+	clients/meson.build			\
+	compositor/meson.build			\
+	data/meson.build			\
+	desktop-shell/meson.build		\
+	fullscreen-shell/meson.build		\
+	ivi-shell/meson.build			\
+	libweston-desktop/meson.build		\
+	libweston/git-version.h.meson		\
+	libweston/meson.build			\
+	man/meson.build				\
+	meson.build				\
+	meson_options.txt			\
+	protocol/meson.build			\
+	remoting/meson.build			\
+	shared/meson.build			\
+	tests/meson.build			\
+	wcap/meson.build			\
+	xwayland/meson.build

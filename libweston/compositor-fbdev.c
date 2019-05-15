@@ -78,6 +78,14 @@ struct fbdev_screeninfo {
 	unsigned int refresh_rate; /* Hertz */
 };
 
+struct fbdev_head {
+	struct weston_head base;
+
+	/* Frame buffer details. */
+	char *device;
+	struct fbdev_screeninfo fb_info;
+};
+
 struct fbdev_output {
 	struct fbdev_backend *backend;
 	struct weston_output base;
@@ -85,16 +93,21 @@ struct fbdev_output {
 	struct weston_mode mode;
 	struct wl_event_source *finish_frame_timer;
 
-	/* Frame buffer details. */
-	char *device;
-	struct fbdev_screeninfo fb_info;
-	void *fb; /* length is fb_info.buffer_length */
+	/* framebuffer mmap details */
+	size_t buffer_length;
+	void *fb;
 
 	/* pixman details. */
 	pixman_image_t *hw_surface;
 };
 
 static const char default_seat[] = "seat0";
+
+static inline struct fbdev_head *
+to_fbdev_head(struct weston_head *base)
+{
+	return container_of(base, struct fbdev_head, base);
+}
 
 static inline struct fbdev_output *
 to_fbdev_output(struct weston_output *base)
@@ -106,6 +119,16 @@ static inline struct fbdev_backend *
 to_fbdev_backend(struct weston_compositor *base)
 {
 	return container_of(base->backend, struct fbdev_backend, base);
+}
+
+static struct fbdev_head *
+fbdev_output_get_head(struct fbdev_output *output)
+{
+	if (wl_list_length(&output->base.head_list) != 1)
+		return NULL;
+
+	return container_of(output->base.head_list.next,
+			    struct fbdev_head, base.output_link);
 }
 
 static void
@@ -211,8 +234,8 @@ calculate_pixman_format(struct fb_var_screeninfo *vinfo,
 	    vinfo->blue.msb_right != 0)
 		return 0;
 
-	/* Work out the format type from the offsets. We only support RGBA and
-	 * ARGB at the moment. */
+	/* Work out the format type from the offsets. We only support RGBA, ARGB
+	 * and ABGR at the moment. */
 	type = PIXMAN_TYPE_OTHER;
 
 	if ((vinfo->transp.offset >= vinfo->red.offset ||
@@ -224,6 +247,10 @@ calculate_pixman_format(struct fb_var_screeninfo *vinfo,
 	         vinfo->green.offset >= vinfo->blue.offset &&
 	         vinfo->blue.offset >= vinfo->transp.offset)
 		type = PIXMAN_TYPE_RGBA;
+	else if (vinfo->transp.offset >= vinfo->blue.offset &&
+	         vinfo->blue.offset >= vinfo->green.offset &&
+	         vinfo->green.offset >= vinfo->red.offset)
+		type = PIXMAN_TYPE_ABGR;
 
 	if (type == PIXMAN_TYPE_OTHER)
 		return 0;
@@ -335,6 +362,27 @@ fbdev_set_screen_info(int fd, struct fbdev_screeninfo *info)
 	return 1;
 }
 
+static int
+fbdev_wakeup_screen(int fd, struct fbdev_screeninfo *info)
+{
+	struct fb_var_screeninfo varinfo;
+
+	/* Grab the current screen information. */
+	if (ioctl(fd, FBIOGET_VSCREENINFO, &varinfo) < 0) {
+		return -1;
+	}
+
+	/* force the framebuffer to wake up */
+	varinfo.activate = FB_ACTIVATE_NOW | FB_ACTIVATE_FORCE;
+
+	/* Set the device's screen information. */
+	if (ioctl(fd, FBIOPUT_VSCREENINFO, &varinfo) < 0) {
+		return -1;
+	}
+
+	return 1;
+}
+
 /* Returns an FD for the frame buffer device. */
 static int
 fbdev_frame_buffer_open(const char *fb_dev,
@@ -361,6 +409,14 @@ fbdev_frame_buffer_open(const char *fb_dev,
 		return -1;
 	}
 
+	/* Attempt to wake up the framebuffer device, needed for secondary
+	 * framebuffer devices */
+	if (fbdev_wakeup_screen(fd, screen_info) < 0) {
+		weston_log("Failed to activate framebuffer display. "
+		           "Attempting to open output anyway.\n");
+	}
+
+
 	return fd;
 }
 
@@ -368,13 +424,17 @@ fbdev_frame_buffer_open(const char *fb_dev,
 static int
 fbdev_frame_buffer_map(struct fbdev_output *output, int fd)
 {
+	struct fbdev_head *head;
 	int retval = -1;
+
+	head = fbdev_output_get_head(output);
 
 	weston_log("Mapping fbdev frame buffer.\n");
 
 	/* Map the frame buffer. Write-only mode, since we don't want to read
 	 * anything back (because it's slow). */
-	output->fb = mmap(NULL, output->fb_info.buffer_length,
+	output->buffer_length = head->fb_info.buffer_length;
+	output->fb = mmap(NULL, output->buffer_length,
 	                  PROT_WRITE, MAP_SHARED, fd, 0);
 	if (output->fb == MAP_FAILED) {
 		weston_log("Failed to mmap frame buffer: %s\n",
@@ -385,11 +445,11 @@ fbdev_frame_buffer_map(struct fbdev_output *output, int fd)
 
 	/* Create a pixman image to wrap the memory mapped frame buffer. */
 	output->hw_surface =
-		pixman_image_create_bits(output->fb_info.pixel_format,
-		                         output->fb_info.x_resolution,
-		                         output->fb_info.y_resolution,
+		pixman_image_create_bits(head->fb_info.pixel_format,
+		                         head->fb_info.x_resolution,
+		                         head->fb_info.y_resolution,
 		                         output->fb,
-		                         output->fb_info.line_length);
+		                         head->fb_info.line_length);
 	if (output->hw_surface == NULL) {
 		weston_log("Failed to create surface for frame buffer.\n");
 		goto out_unmap;
@@ -400,7 +460,7 @@ fbdev_frame_buffer_map(struct fbdev_output *output, int fd)
 
 out_unmap:
 	if (retval != 0 && output->fb != NULL) {
-		munmap(output->fb, output->fb_info.buffer_length);
+		munmap(output->fb, output->buffer_length);
 		output->fb = NULL;
 	}
 
@@ -425,11 +485,35 @@ fbdev_frame_buffer_unmap(struct fbdev_output *output)
 		pixman_image_unref(output->hw_surface);
 	output->hw_surface = NULL;
 
-	if (munmap(output->fb, output->fb_info.buffer_length) < 0)
+	if (munmap(output->fb, output->buffer_length) < 0)
 		weston_log("Failed to munmap frame buffer: %s\n",
 		           strerror(errno));
 
 	output->fb = NULL;
+}
+
+
+static int
+fbdev_output_attach_head(struct weston_output *output_base,
+			 struct weston_head *head_base)
+{
+	struct fbdev_output *output = to_fbdev_output(output_base);
+	struct fbdev_head *head = to_fbdev_head(head_base);
+
+	/* Clones not supported. */
+	if (!wl_list_empty(&output->base.head_list))
+		return -1;
+
+	/* only one static mode in list */
+	output->mode.flags = WL_OUTPUT_MODE_CURRENT | WL_OUTPUT_MODE_PREFERRED;
+	output->mode.width = head->fb_info.x_resolution;
+	output->mode.height = head->fb_info.y_resolution;
+	output->mode.refresh = head->fb_info.refresh_rate;
+	wl_list_init(&output->base.mode_list);
+	wl_list_insert(&output->base.mode_list, &output->mode.link);
+	output->base.current_mode = &output->mode;
+
+	return 0;
 }
 
 static void fbdev_output_destroy(struct weston_output *base);
@@ -439,11 +523,14 @@ fbdev_output_enable(struct weston_output *base)
 {
 	struct fbdev_output *output = to_fbdev_output(base);
 	struct fbdev_backend *backend = to_fbdev_backend(base->compositor);
+	struct fbdev_head *head;
 	int fb_fd;
 	struct wl_event_loop *loop;
 
+	head = fbdev_output_get_head(output);
+
 	/* Create the frame buffer. */
-	fb_fd = fbdev_frame_buffer_open(output->device, &output->fb_info);
+	fb_fd = fbdev_frame_buffer_open(head->device, &head->fb_info);
 	if (fb_fd < 0) {
 		weston_log("Creating frame buffer failed.\n");
 		return -1;
@@ -457,7 +544,8 @@ fbdev_output_enable(struct weston_output *base)
 	output->base.start_repaint_loop = fbdev_output_start_repaint_loop;
 	output->base.repaint = fbdev_output_repaint;
 
-	if (pixman_renderer_output_create(&output->base) < 0)
+	if (pixman_renderer_output_create(&output->base,
+					PIXMAN_RENDERER_OUTPUT_USE_SHADOW) < 0)
 		goto out_hw_surface;
 
 	loop = wl_display_get_event_loop(backend->compositor->wl_display);
@@ -494,62 +582,80 @@ fbdev_output_disable(struct weston_output *base)
 	return 0;
 }
 
-static int
-fbdev_output_create(struct fbdev_backend *backend,
-                    const char *device)
+static struct fbdev_head *
+fbdev_head_create(struct fbdev_backend *backend, const char *device)
+{
+	struct fbdev_head *head;
+	int fb_fd;
+
+	head = zalloc(sizeof *head);
+	if (!head)
+		return NULL;
+
+	head->device = strdup(device);
+
+	/* Create the frame buffer. */
+	fb_fd = fbdev_frame_buffer_open(head->device, &head->fb_info);
+	if (fb_fd < 0) {
+		weston_log("Creating frame buffer head failed.\n");
+		goto out_free;
+	}
+	close(fb_fd);
+
+	weston_head_init(&head->base, "fbdev");
+	weston_head_set_connection_status(&head->base, true);
+	weston_head_set_monitor_strings(&head->base, "unknown",
+					head->fb_info.id, NULL);
+	weston_head_set_subpixel(&head->base, WL_OUTPUT_SUBPIXEL_UNKNOWN);
+	weston_head_set_physical_size(&head->base, head->fb_info.width_mm,
+				      head->fb_info.height_mm);
+
+	weston_compositor_add_head(backend->compositor, &head->base);
+
+	weston_log("Created head '%s' for device %s (%s)\n",
+		   head->base.name, head->device, head->base.model);
+
+	return head;
+
+out_free:
+	free(head->device);
+	free(head);
+
+	return NULL;
+}
+
+static void
+fbdev_head_destroy(struct fbdev_head *head)
+{
+	weston_head_release(&head->base);
+	free(head->device);
+	free(head);
+}
+
+static struct weston_output *
+fbdev_output_create(struct weston_compositor *compositor,
+                    const char *name)
 {
 	struct fbdev_output *output;
-	int fb_fd;
 
 	weston_log("Creating fbdev output.\n");
 
 	output = zalloc(sizeof *output);
 	if (output == NULL)
-		return -1;
+		return NULL;
 
-	output->backend = backend;
-	output->device = strdup(device);
+	output->backend = to_fbdev_backend(compositor);
 
-	/* Create the frame buffer. */
-	fb_fd = fbdev_frame_buffer_open(device, &output->fb_info);
-	if (fb_fd < 0) {
-		weston_log("Creating frame buffer failed.\n");
-		goto out_free;
-	}
-
-	weston_output_init(&output->base, backend->compositor, "fbdev");
+	weston_output_init(&output->base, compositor, name);
 
 	output->base.destroy = fbdev_output_destroy;
 	output->base.disable = fbdev_output_disable;
 	output->base.enable = fbdev_output_enable;
+	output->base.attach_head = fbdev_output_attach_head;
 
-	/* only one static mode in list */
-	output->mode.flags =
-		WL_OUTPUT_MODE_CURRENT | WL_OUTPUT_MODE_PREFERRED;
-	output->mode.width = output->fb_info.x_resolution;
-	output->mode.height = output->fb_info.y_resolution;
-	output->mode.refresh = output->fb_info.refresh_rate;
-	wl_list_insert(&output->base.mode_list, &output->mode.link);
+	weston_compositor_add_pending_output(&output->base, compositor);
 
-	output->base.current_mode = &output->mode;
-	output->base.subpixel = WL_OUTPUT_SUBPIXEL_UNKNOWN;
-	output->base.make = "unknown";
-	output->base.model = output->fb_info.id;
-
-	output->base.mm_width = output->fb_info.width_mm;
-	output->base.mm_height = output->fb_info.height_mm;
-
-	close(fb_fd);
-
-	weston_compositor_add_pending_output(&output->base, backend->compositor);
-
-	return 0;
-
-out_free:
-	free(output->device);
-	free(output);
-
-	return -1;
+	return &output->base;
 }
 
 static void
@@ -564,7 +670,6 @@ fbdev_output_destroy(struct weston_output *base)
 	/* Remove the output. */
 	weston_output_release(&output->base);
 
-	free(output->device);
 	free(output);
 }
 
@@ -590,62 +695,62 @@ fbdev_output_reenable(struct fbdev_backend *backend,
                       struct weston_output *base)
 {
 	struct fbdev_output *output = to_fbdev_output(base);
+	struct fbdev_head *head;
 	struct fbdev_screeninfo new_screen_info;
 	int fb_fd;
-	char *device;
+
+	head = fbdev_output_get_head(output);
 
 	weston_log("Re-enabling fbdev output.\n");
+	assert(output->base.enabled);
 
 	/* Create the frame buffer. */
-	fb_fd = fbdev_frame_buffer_open(output->device, &new_screen_info);
+	fb_fd = fbdev_frame_buffer_open(head->device, &new_screen_info);
 	if (fb_fd < 0) {
 		weston_log("Creating frame buffer failed.\n");
-		goto err;
+		return -1;
 	}
 
 	/* Check whether the frame buffer details have changed since we were
 	 * disabled. */
-	if (compare_screen_info (&output->fb_info, &new_screen_info) != 0) {
+	if (compare_screen_info(&head->fb_info, &new_screen_info) != 0) {
 		/* Perform a mode-set to restore the old mode. */
-		if (fbdev_set_screen_info(fb_fd, &output->fb_info) < 0) {
+		if (fbdev_set_screen_info(fb_fd, &head->fb_info) < 0) {
 			weston_log("Failed to restore mode settings. "
 			           "Attempting to re-open output anyway.\n");
 		}
 
 		close(fb_fd);
 
-		/* Remove and re-add the output so that resources depending on
+		/* Disable and enable the output so that resources depending on
 		 * the frame buffer X/Y resolution (such as the shadow buffer)
 		 * are re-initialised. */
-		device = strdup(output->device);
-		fbdev_output_destroy(&output->base);
-		fbdev_output_create(backend, device);
-		free(device);
-
-		return 0;
+		fbdev_output_disable(&output->base);
+		return fbdev_output_enable(&output->base);
 	}
 
 	/* Map the device if it has the same details as before. */
 	if (fbdev_frame_buffer_map(output, fb_fd) < 0) {
 		weston_log("Mapping frame buffer failed.\n");
-		goto err;
+		return -1;
 	}
 
 	return 0;
-
-err:
-	return -1;
 }
 
 static void
 fbdev_backend_destroy(struct weston_compositor *base)
 {
 	struct fbdev_backend *backend = to_fbdev_backend(base);
+	struct weston_head *head, *next;
 
 	udev_input_destroy(&backend->input);
 
 	/* Destroy the output. */
 	weston_compositor_shutdown(base);
+
+	wl_list_for_each_safe(head, next, &base->head_list, compositor_link)
+		fbdev_head_destroy(to_fbdev_head(head));
 
 	/* Chain up. */
 	weston_launcher_destroy(base->launcher);
@@ -698,12 +803,90 @@ session_notify(struct wl_listener *listener, void *data)
 	}
 }
 
+static char *
+find_framebuffer_device(struct fbdev_backend *b, const char *seat)
+{
+	struct udev_enumerate *e;
+	struct udev_list_entry *entry;
+	const char *path, *device_seat, *id;
+	char *fb_device_path = NULL;
+	struct udev_device *device, *fb_device, *pci;
+
+	e = udev_enumerate_new(b->udev);
+	udev_enumerate_add_match_subsystem(e, "graphics");
+	udev_enumerate_add_match_sysname(e, "fb[0-9]*");
+
+	udev_enumerate_scan_devices(e);
+	fb_device = NULL;
+	udev_list_entry_foreach(entry, udev_enumerate_get_list_entry(e)) {
+		bool is_boot_vga = false;
+
+		path = udev_list_entry_get_name(entry);
+		device = udev_device_new_from_syspath(b->udev, path);
+		if (!device)
+			continue;
+		device_seat = udev_device_get_property_value(device, "ID_SEAT");
+		if (!device_seat)
+			device_seat = default_seat;
+		if (strcmp(device_seat, seat)) {
+			udev_device_unref(device);
+			continue;
+		}
+
+		pci = udev_device_get_parent_with_subsystem_devtype(device,
+								"pci", NULL);
+		if (pci) {
+			id = udev_device_get_sysattr_value(pci, "boot_vga");
+			if (id && !strcmp(id, "1"))
+				is_boot_vga = true;
+		}
+
+		/* If a framebuffer device was found, and this device isn't
+		 * the boot-VGA device, don't use it. */
+		if (!is_boot_vga && fb_device) {
+			udev_device_unref(device);
+			continue;
+		}
+
+		/* There can only be one boot_vga device. Try to use it
+		 * at all costs. */
+		if (is_boot_vga) {
+			if (fb_device)
+				udev_device_unref(fb_device);
+			fb_device = device;
+			break;
+		}
+
+		/* Per the (!is_boot_vga && fb_device) test above, only
+		 * trump existing saved devices with boot-VGA devices, so if
+		 * the test ends up here, this must be the first device seen. */
+		assert(!fb_device);
+		fb_device = device;
+	}
+
+	udev_enumerate_unref(e);
+
+	if (fb_device) {
+		fb_device_path = strdup(udev_device_get_devnode(fb_device));
+		udev_device_unref(fb_device);
+	}
+
+	return fb_device_path;
+}
+
 static struct fbdev_backend *
 fbdev_backend_create(struct weston_compositor *compositor,
                      struct weston_fbdev_backend_config *param)
 {
 	struct fbdev_backend *backend;
 	const char *seat_id = default_seat;
+	const char *session_seat;
+
+	session_seat = getenv("XDG_SEAT");
+	if (session_seat)
+		seat_id = session_seat;
+	if (param->seat_id)
+		seat_id = param->seat_id;
 
 	weston_log("initializing fbdev backend\n");
 
@@ -723,12 +906,19 @@ fbdev_backend_create(struct weston_compositor *compositor,
 		goto out_compositor;
 	}
 
+	if (!param->device)
+		param->device = find_framebuffer_device(backend, seat_id);
+	if (!param->device) {
+		weston_log("fatal: no framebuffer devices detected.\n");
+		goto out_udev;
+	}
+
 	/* Set up the TTY. */
 	backend->session_listener.notify = session_notify;
 	wl_signal_add(&compositor->session_signal,
 		      &backend->session_listener);
 	compositor->launcher =
-		weston_launcher_connect(compositor, param->tty, "seat0", false);
+		weston_launcher_connect(compositor, param->tty, seat_id, false);
 	if (!compositor->launcher) {
 		weston_log("fatal: fbdev backend should be run using "
 			   "weston-launch binary, or your system should "
@@ -737,6 +927,7 @@ fbdev_backend_create(struct weston_compositor *compositor,
 	}
 
 	backend->base.destroy = fbdev_backend_destroy;
+	backend->base.create_output = fbdev_output_create;
 
 	backend->prev_state = WESTON_COMPOSITOR_ACTIVE;
 
@@ -745,8 +936,10 @@ fbdev_backend_create(struct weston_compositor *compositor,
 	if (pixman_renderer_init(compositor) < 0)
 		goto out_launcher;
 
-	if (fbdev_output_create(backend, param->device) < 0)
+	if (!fbdev_head_create(backend, param->device))
 		goto out_launcher;
+
+	free(param->device);
 
 	udev_input_init(&backend->input, compositor, backend->udev,
 			seat_id, param->configure_device);
@@ -754,6 +947,7 @@ fbdev_backend_create(struct weston_compositor *compositor,
 	return backend;
 
 out_launcher:
+	free(param->device);
 	weston_launcher_destroy(compositor->launcher);
 
 out_udev:
@@ -769,10 +963,9 @@ out_compositor:
 static void
 config_init_to_defaults(struct weston_fbdev_backend_config *config)
 {
-	/* TODO: Ideally, available frame buffers should be enumerated using
-	 * udev, rather than passing a device node in as a parameter. */
 	config->tty = 0; /* default to current tty */
-	config->device = "/dev/fb0"; /* default frame buffer */
+	config->device = NULL;
+	config->seat_id = NULL;
 }
 
 WL_EXPORT int

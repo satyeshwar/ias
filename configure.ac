@@ -1,18 +1,18 @@
-m4_define([weston_major_version], [4])
+m4_define([weston_major_version], [6])
 m4_define([weston_minor_version], [0])
-m4_define([weston_micro_version], [17])
+m4_define([weston_micro_version], [0])
 m4_define([weston_version],
           [weston_major_version.weston_minor_version.weston_micro_version])
-m4_define([libweston_major_version], [4])
+m4_define([libweston_major_version], [6])
 m4_define([libweston_minor_version], [0])
-m4_define([libweston_patch_version], [17])
+m4_define([libweston_patch_version], [0])
 
 AC_PREREQ([2.64])
 AC_INIT([weston],
         [weston_version],
-        [https://bugs.freedesktop.org/enter_bug.cgi?product=Wayland&component=weston&version=weston_version],
+        [https://gitlab.freedesktop.org/wayland/weston/issues/],
         [weston],
-        [http://wayland.freedesktop.org])
+        [https://wayland.freedesktop.org])
 
 WAYLAND_PREREQ_VERSION="1.12.0"
 
@@ -85,12 +85,30 @@ AC_PROG_CXX
 LT_PREREQ([2.2])
 LT_INIT([disable-static])
 
+AC_ARG_ENABLE(autotools,
+	      AS_HELP_STRING([--enable-autotools],
+			     [Allow building with autotools]),,
+	      enable_autotools=no)
+if test "x$enable_autotools" = "xno"; then
+	AC_ERROR([
+	*** Autotools support will be removed after the 6.0.0 release ***
+
+	Please, try the Meson based build and report any problems you might have
+	with it. Instructions and references can be found in README.md.
+	If you still want to continue building with autotools,
+	use --enable-autotools configure option.
+	])
+fi
+
 AC_ARG_VAR([WESTON_NATIVE_BACKEND],
            [Set the native backend to use, if Weston is not running under Wayland nor X11. @<:@default=drm-backend.so@:>@])
 AC_ARG_VAR([WESTON_SHELL_CLIENT],
            [Set the default desktop shell client to load if none is specified in weston.ini. @<:@default=weston-desktop-shell@:>@])
 
 PKG_PROG_PKG_CONFIG()
+
+# Check pthread
+AX_PTHREAD
 
 # Check for dlsym instead of dlopen because ASAN hijacks the latter
 WESTON_SEARCH_LIBS([DL], [dl], [dlsym])
@@ -108,13 +126,12 @@ AC_CHECK_DECL(TFD_CLOEXEC,[],
 AC_CHECK_DECL(CLOCK_MONOTONIC,[],
 	      [AC_MSG_ERROR("CLOCK_MONOTONIC is needed to compile weston")],
 	      [[#include <time.h>]])
-AC_CHECK_HEADERS([execinfo.h])
 
 AC_CHECK_FUNCS([mkostemp strchrnul initgroups posix_fallocate])
 
 # check for libdrm as a build-time dependency only
 # libdrm 2.4.30 introduced drm_fourcc.h.
-PKG_CHECK_MODULES(LIBDRM, [libdrm >= 2.4.30], [], [AC_MSG_ERROR([
+PKG_CHECK_MODULES(LIBDRM, [libdrm >= 2.4.68], [], [AC_MSG_ERROR([
      libdrm is a hard build-time dependency for libweston core,
      but a sufficient version was not found. However, libdrm
      is not a runtime dependency unless you have features
@@ -147,7 +164,6 @@ AM_CONDITIONAL(ENABLE_EGL, test x$enable_egl = xyes)
 if test x$enable_egl = xyes; then
 	AC_DEFINE([ENABLE_EGL], [1], [Build Weston with EGL support])
 	PKG_CHECK_MODULES(EGL, [egl glesv2])
-        PKG_CHECK_MODULES([EGL_TESTS], [egl glesv2 wayland-client wayland-egl])
 	AC_CHECK_HEADERS([linux/sync_file.h])
 fi
 
@@ -212,6 +228,16 @@ if test x$enable_x11_compositor = xyes; then
   AC_DEFINE([BUILD_X11_COMPOSITOR], [1], [Build the X11 compositor])
 fi
 
+AC_ARG_ENABLE(remoting, [  --enable-remoting],,
+              enable_remoting=no)
+AM_CONDITIONAL(ENABLE_REMOTING, test x$enable_remoting = xyes)
+if test x$enable_remoting = xyes; then
+  if test x$enable_drm_compositor != xyes; then
+    AC_MSG_WARN([The remoting-plugin.so module requires the DRM backend.])
+  fi
+  PKG_CHECK_MODULES(REMOTING_GST, [gstreamer-1.0 gstreamer-allocators-1.0 gstreamer-app-1.0 gstreamer-video-1.0])
+fi
+
 
 AC_ARG_ENABLE(drm-compositor, [  --enable-drm-compositor],,
 	      enable_drm_compositor=yes)
@@ -219,33 +245,39 @@ AM_CONDITIONAL(ENABLE_DRM_COMPOSITOR, test x$enable_drm_compositor = xyes)
 if test x$enable_drm_compositor = xyes; then
   AC_DEFINE([BUILD_DRM_COMPOSITOR], [1], [Build the DRM compositor])
   PKG_CHECK_MODULES(DRM_COMPOSITOR, [libudev >= 136 libdrm >= 2.4.30 gbm])
+  PKG_CHECK_MODULES(DRM_COMPOSITOR_MODIFIERS, [libdrm >= 2.4.71],
+		    [AC_DEFINE([HAVE_DRM_ADDFB2_MODIFIERS], 1, [libdrm supports modifiers])],
+		    [AC_MSG_WARN([libdrm does not support AddFB2 with modifiers])])
   PKG_CHECK_MODULES(DRM_COMPOSITOR_ATOMIC, [libdrm >= 2.4.78],
 		    [AC_DEFINE([HAVE_DRM_ATOMIC], 1, [libdrm supports atomic API])],
 		    [AC_MSG_WARN([libdrm does not support atomic modesetting, will omit that capability])])
-  PKG_CHECK_MODULES(DRM_COMPOSITOR_GBM, [gbm >= 10.2],
-		    [AC_DEFINE([HAVE_GBM_FD_IMPORT], 1, [gbm supports dmabuf import])],
-		    [AC_MSG_WARN([gbm does not support dmabuf import, will omit that capability])])
+  PKG_CHECK_MODULES(DRM_COMPOSITOR_FORMATS_BLOB, [libdrm >= 2.4.83],
+		    [AC_DEFINE([HAVE_DRM_FORMATS_BLOB], 1, [libdrm supports modifier advertisement])],
+		    [AC_MSG_WARN([libdrm does not support modifier advertisement])])
+  PKG_CHECK_MODULES(DRM_COMPOSITOR_GBM_MODIFIERS, [gbm >= 17.1],
+		    [AC_DEFINE([HAVE_GBM_MODIFIERS], 1, [GBM supports modifiers])],
+		    [AC_MSG_WARN([GBM does not support modifiers])])
+  PKG_CHECK_MODULES(DRM_COMPOSITOR_GBM, [gbm >= 17.2],
+		    [AC_DEFINE([HAVE_GBM_FD_IMPORT], 1, [gbm supports import with modifiers])],
+		    [AC_MSG_WARN([GBM does not support dmabuf import, will omit that capability])])
 fi
 
-AC_ARG_ENABLE(emgd-compositor, [  --enable-emgd-compositor],,
-	      enable_emgd_compositor=yes)
-AM_CONDITIONAL(ENABLE_IAS_COMPOSITOR, test x$enable_emgd_compositor = xyes)
-if test x$enable_emgd_compositor = xyes; then
+AC_ARG_ENABLE(ias-compositor, [  --enable-ias-compositor],,
+	      enable_ias_compositor=yes)
+AM_CONDITIONAL(ENABLE_IAS_COMPOSITOR, test x$enable_ias_compositor = xyes)
+if test x$enable_ias_compositor = xyes; then
   AC_DEFINE([BUILD_IAS_COMPOSITOR], [1], [Build the IAS compositor])
   PKG_CHECK_MODULES(IAS_COMPOSITOR, [libudev >= 136 libdrm >= 2.4.30 gbm mtdev >= 1.1.0])
 fi
 
-AC_ARG_ENABLE(text-backend, [  --enable-text-backend],,
-	      enable_text_backend=no)
-AM_CONDITIONAL(ENABLE_TEXT_BACKEND, test x$enable_text_backend = xyes)
-if test x$enable_text_backend = xyes; then
-  AC_DEFINE([TEXT_BACKEND], [1], [Text backend for onscreen keyboard])
-fi
-
+PKG_CHECK_MODULES(LIBEVDEV, [libevdev])
 PKG_CHECK_MODULES(LIBINPUT_BACKEND, [libinput >= 0.8.0])
 PKG_CHECK_MODULES(COMPOSITOR, [$COMPOSITOR_MODULES])
 
-PKG_CHECK_MODULES(WAYLAND_PROTOCOLS, [wayland-protocols >= 1.13],
+# XXX: For minor version 2 of zwp_linux_explicit_synchronization_v1, we
+# actually need a development version after 1.17, but there is no way to
+# express such a requirement at the moment.
+PKG_CHECK_MODULES(WAYLAND_PROTOCOLS, [wayland-protocols >= 1.17],
 		  [ac_wayland_protocols_pkgdatadir=`$PKG_CONFIG --variable=pkgdatadir wayland-protocols`])
 AC_SUBST(WAYLAND_PROTOCOLS_DATADIR, $ac_wayland_protocols_pkgdatadir)
 
@@ -291,10 +323,17 @@ if test x$enable_rdp_compositor = xyes; then
     [],
     [PKG_CHECK_MODULES(RDP_COMPOSITOR, [freerdp >= 1.1.0],[])]
   )
-
   SAVED_CPPFLAGS="$CPPFLAGS"
   CPPFLAGS="$CPPFLAGS $RDP_COMPOSITOR_CFLAGS"
+
   AC_CHECK_HEADERS([freerdp/version.h])
+  AC_CHECK_MEMBER([SURFACE_BITS_COMMAND.bmp],
+	[AC_DEFINE([HAVE_SURFACE_BITS_BMP], [1], [SURFACE_BITS_CMD has bmp field])],
+	[],
+	[[#include <freerdp/update.h>]]
+  )
+
+
   CPPFLAGS="$SAVED_CPPFLAGS"
 fi
 
@@ -383,20 +422,6 @@ if test x$enable_vaapi_recorder != xno; then
 fi
 AM_CONDITIONAL(ENABLE_VAAPI_RECORDER, test "x$have_libva" = xyes)
 
-AC_ARG_ENABLE(frame-capture, [  --enable-frame-capture],,
-	      enable_frame_capture=no)
-if test x$enable_frame_capture != xno; then
-  PKG_CHECK_MODULES(LIBVA, [libva >= 0.99.0 libva-drm >= 0.99.0],
-                    [have_libva=yes], [have_libva=no])
-  if test "x$have_libva" = "xno" -a "x$enable_frame_capture" = "xyes"; then
-    AC_MSG_ERROR([frame-capture explicitly enabled, but libva couldn't be found])
-  fi
-  AS_IF([test "x$have_libva" = "xyes" -a "x$enable_frame_capture" = "xyes"],
-        [AC_DEFINE([BUILD_FRAME_CAPTURE], [1], [Build with frame capture support])])
-fi
-AM_CONDITIONAL(ENABLE_FRAME_CAPTURE, test "x$have_libva" = "xyes" -a "x$enable_frame_capture" = "xyes")
-
-
 AC_ARG_ENABLE(remote-display, [  --enable-remote-display],,
 	      enable_remote_display=no)
 if test x$enable_remote_display != xno; then
@@ -405,14 +430,10 @@ if test x$enable_remote_display != xno; then
   if test "x$have_libva" = "xno" -a "x$enable_remote_display" = "xyes"; then
     AC_MSG_ERROR([remote-display explicitly enabled, but libva couldn't be found])
   fi
-  if test "x$enable_frame_capture" = "xno" -a "x$enable_remote_display" = "xyes"; then
-    AC_MSG_ERROR([remote-display explicitly enabled, but frame capture is not])
-  fi
-  AS_IF([test "x$have_libva" = "xyes" -a "x$enable_frame_capture" = "xyes"],
+  AS_IF([test "x$have_libva" = "xyes" -a "x$enable_remote_display" = "xyes"],
         [AC_DEFINE([BUILD_REMOTE_DISPLAY], [1], [Build remote display])])
-  PKG_CHECK_MODULES(GSTREAMER, [gstreamer-1.0 gstreamer-plugins-base-1.0])
 fi
-AM_CONDITIONAL(ENABLE_REMOTE_DISPLAY, test "x$have_libva" = "xyes" -a "x$enable_frame_capture" = "xyes")
+AM_CONDITIONAL(ENABLE_REMOTE_DISPLAY, test "x$have_libva" = "xyes" -a "x$enable_remote_display" = "xyes")
 
 
 AC_ARG_ENABLE(profile-remote-display, [  --profile-remote-display],,
@@ -463,7 +484,7 @@ AC_ARG_ENABLE(simple-dmabuf-drm-client,
                              [do not build the simple dmabuf drm client]),,
               enable_simple_dmabuf_drm_client="auto")
 if ! test "x$enable_simple_dmabuf_drm_client" = "xno"; then
-  PKG_CHECK_MODULES(SIMPLE_DMABUF_DRM_CLIENT, [wayland-client libdrm egl], [have_simple_dmabuf_libs=yes],
+  PKG_CHECK_MODULES(SIMPLE_DMABUF_DRM_CLIENT, [wayland-client libdrm], [have_simple_dmabuf_libs=yes],
 		    [have_simple_dmabuf_libs=no])
 
   PKG_CHECK_MODULES(LIBDRM_PLATFORM_FREEDRENO, [libdrm_freedreno],
@@ -472,11 +493,14 @@ if ! test "x$enable_simple_dmabuf_drm_client" = "xno"; then
   PKG_CHECK_MODULES(LIBDRM_PLATFORM_INTEL, [libdrm_intel],
       AC_DEFINE([HAVE_LIBDRM_INTEL], [1], [Build intel dmabuf client]) have_simple_dmabuf_drm_client=yes,
       [true])
+  PKG_CHECK_MODULES(LIBDRM_PLATFORM_ETNAVIV, [libdrm_etnaviv],
+      AC_DEFINE([HAVE_LIBDRM_ETNAVIV], [1], [Build etnaviv dmabuf client]) have_simple_dmabuf_drm_client=yes,
+      [true])
 
   if test "x$have_simple_dmabuf_drm_client" != "xyes" -o \
 	  "x$have_simple_dmabuf_libs" = "xno" && \
      test "x$enable_simple_dmabuf_drm_client" = "xyes"; then
-    AC_MSG_ERROR([DRM dmabuf client explicitly enabled, but libdrm_intel or libdrm_freedreno not found])
+    AC_MSG_ERROR([DRM dmabuf client explicitly enabled, but none of libdrm_{intel,freedreno,etnaviv} found])
   fi
 
   if test "x$have_simple_dmabuf_drm_client" = "xyes" -a "x$have_simple_dmabuf_libs" = "xyes"; then
@@ -498,6 +522,21 @@ if ! test "x$enable_simple_dmabuf_v4l_client" = "xno"; then
   enable_simple_dmabuf_v4l_client="$have_simple_dmabuf_v4l_client"
 fi
 AM_CONDITIONAL(BUILD_SIMPLE_DMABUF_V4L_CLIENT, test "x$enable_simple_dmabuf_v4l_client" = "xyes")
+
+AC_ARG_ENABLE(simple-dmabuf-egl-client,
+              AS_HELP_STRING([--disable-simple-dmabuf-egl-client],
+                             [do not build the simple dmabuf egl client]),,
+              enable_simple_dmabuf_egl_client="auto")
+if ! test "x$enable_simple_dmabuf_egl_client" = "xno"; then
+  PKG_CHECK_MODULES(SIMPLE_DMABUF_EGL_CLIENT, [wayland-client libdrm gbm egl glesv2],
+		    [have_simple_dmabuf_egl_client=yes], [have_simple_dmabuf_egl_client=no])
+
+  if test "x$have_simple_dmabuf_egl_client" = "xno" -a "x$enable_simple_dmabuf_egl_client" = "xyes"; then
+    AC_MSG_ERROR([EGL dmabuf client explicitly enabled, but libdrm/egl/glev2 couldn't be found])
+  fi
+  enable_simple_dmabuf_egl_client="$have_simple_dmabuf_egl_client"
+fi
+AM_CONDITIONAL(BUILD_SIMPLE_DMABUF_EGL_CLIENT, test "x$enable_simple_dmabuf_egl_client" = "xyes")
 
 AC_ARG_ENABLE(clients, [  --enable-clients],, enable_clients=yes)
 AM_CONDITIONAL(BUILD_CLIENTS, test x$enable_clients = xyes)
@@ -602,13 +641,6 @@ if test x$enable_ivi_shell = xyes; then
 	 AC_ERROR([expat not found])
    fi
 fi
-
-AC_ARG_ENABLE(layer-manager-control,
-	      AS_HELP_STRING([--enable-layer-manager-control],
-			     [Enable IVI LayerManagerControl tool [default=no]]),,
-	      enable_layer_manager_control=no)
-AM_CONDITIONAL(ENABLE_LAYER_MANAGER_CONTROL,
-	       test x$enable_layer_manager_control = xyes)
 
 AC_ARG_ENABLE(tracing,
 			  AS_HELP_STRING([--enable-tracing[=buffsize]],
@@ -755,12 +787,6 @@ else
 	   AC_DEFINE([GENERATE_BINARY_SHADERS], [0], [Generate binary shaders])
 fi
 
-AC_ARG_ENABLE(vm,
-	AS_HELP_STRING([--enable-vm],
-		       [Enable support for vm [default=no]]),,
-		       enable_vm=no)
-AM_CONDITIONAL(ENABLE_VM, test "x$enable_vm" = "xyes")
-
 AC_ARG_ENABLE(hyper-dmabuf,
 	AS_HELP_STRING([--enable-hyper-dmabuf],
 		       [Enable support for surface sharing using hyper dmabuf [default=no]]),,
@@ -772,13 +798,6 @@ AC_ARG_ENABLE(xen-comm-channel,
 		       [Enable support for xen specific communication channel [default=no]]),,
 		       enable_xen_comm_channel=no)
 AM_CONDITIONAL(ENABLE_XEN_COMM_CHANNEL, test "x$enable_xen_comm_channel" = "xyes")
-
-if test "x$enable_vm" != "xyes"; then
-	enable_xen_comm_channel=no
-	enable_hyper_dmabuf=no
-else
-	AC_DEFINE([USE_VM], [1], [Enable VM support])
-fi
 
 if test x$enable_hyper_dmabuf = xyes; then
 	   AC_CHECK_HEADER([hyper_dmabuf.h], [],
@@ -879,18 +898,13 @@ if test x$enable_ivi_share_protocol = xyes; then
                     [libdrm gbm])
 fi
 
-AC_ARG_ENABLE(vmdisplay,
-	AS_HELP_STRING([--enable-vmdisplay],
-		       [Enable support for vmdisplay [default=no]]),,
-		       enable_vmdisplay=no)
-AM_CONDITIONAL(ENABLE_VMDISPLAY, test "x$enable_vmdisplay" = "xyes")
-
 AC_CONFIG_FILES([Makefile libweston/version.h compositor/weston.pc])
 
 # AC_CONFIG_FILES needs the full name when running autoconf, so we need to use
 # libweston_abi_version here, and outside [] because of m4 quoting rules
 AC_CONFIG_FILES([libweston/libweston-]libweston_major_version[.pc:libweston/libweston.pc.in])
 AC_CONFIG_FILES([libweston/libweston-]libweston_major_version[-uninstalled.pc:libweston/libweston-uninstalled.pc.in])
+AC_CONFIG_FILES([libweston/libweston-]libweston_major_version[-protocols.pc:libweston/libweston-protocols.pc.in])
 AC_CONFIG_FILES([libweston-desktop/libweston-desktop-]libweston_major_version[.pc:libweston-desktop/libweston-desktop.pc.in])
 AC_CONFIG_FILES([libweston-desktop/libweston-desktop-]libweston_major_version[-uninstalled.pc:libweston-desktop/libweston-desktop-uninstalled.pc.in])
 
@@ -921,6 +935,8 @@ AC_MSG_RESULT([
 	systemd notify support		${enable_systemd_notify}
 
 	DRM Compositor			${enable_drm_compositor}
+	IAS Compositor			${enable_ias_compositor}
+	Remoting			${enable_remoting}
 	X11 Compositor			${enable_x11_compositor}
 	Wayland Compositor		${enable_wayland_compositor}
 	Headless Compositor		${enable_headless_compositor}
@@ -943,9 +959,6 @@ AC_MSG_RESULT([
 	VA H.264 encoding Support	${have_libva}
 
 	Generate binary shaders		${enable_shadergen}
-
-	VM				${enable_vm}
-        vmdisplay                       ${enable_vmdisplay}
 	Hyper dmabuf			${enable_hyper_dmabuf}
 	Xen communication channel	${enable_xen_comm_channel}
 ])

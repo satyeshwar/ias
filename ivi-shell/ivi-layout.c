@@ -42,8 +42,8 @@
  *    per each frame. See ivi-layout-transition.c in details. Transition
  *    animation interpolates frames between previous properties of ivi_surface
  *    and new ones.
- *    For example, when a property of ivi_surface is changed from invisibile
- *    to visibile, it behaves like fade-in. When ivi_layout_commitChange is
+ *    For example, when a property of ivi_surface is changed from invisible
+ *    to visible, it behaves like fade-in. When ivi_layout_commitChange is
  *    called during transition animation, it cancels the transition and
  *    re-start transition to new properties from current properties of final
  *    frame just before the cancellation.
@@ -153,7 +153,10 @@ ivi_view_destroy(struct ivi_layout_view *ivi_view)
 	wl_list_remove(&ivi_view->pending_link);
 	wl_list_remove(&ivi_view->order_link);
 
-	weston_view_destroy(ivi_view->view);
+	if (weston_surface_is_desktop_surface(ivi_view->ivisurf->surface))
+		weston_desktop_surface_unlink_view(ivi_view->view);
+	else
+		weston_view_destroy(ivi_view->view);
 
 	free(ivi_view);
 }
@@ -170,7 +173,13 @@ ivi_view_create(struct ivi_layout_layer *ivilayer,
 		return NULL;
 	}
 
-	ivi_view->view = weston_view_create(ivisurf->surface);
+	if (weston_surface_is_desktop_surface(ivisurf->surface)) {
+		ivi_view->view = weston_desktop_surface_create_view(
+				ivisurf->weston_desktop_surface);
+	} else {
+		ivi_view->view = weston_view_create(ivisurf->surface);
+	}
+
 	if (ivi_view->view == NULL) {
 		weston_log("fails to allocate memory\n");
 		free(ivi_view);
@@ -586,43 +595,27 @@ update_prop(struct ivi_layout_view *ivi_view)
 	weston_view_schedule_repaint(ivi_view->view);
 }
 
+static bool
+ivi_view_is_mapped(struct ivi_layout_view *ivi_view)
+{
+	return (!wl_list_empty(&ivi_view->order_link) &&
+		ivi_view->on_layer->on_screen &&
+		ivi_view->on_layer->prop.visibility &&
+		ivi_view->ivisurf->prop.visibility);
+}
+
 static void
 commit_changes(struct ivi_layout *layout)
 {
-	struct ivi_layout_screen *iviscrn = NULL;
-	struct ivi_layout_layer *ivilayer = NULL;
-	struct ivi_layout_surface *ivisurf = NULL;
 	struct ivi_layout_view *ivi_view  = NULL;
 
 	wl_list_for_each(ivi_view, &layout->view_list, link) {
-		ivisurf = ivi_view->ivisurf;
-		ivilayer = ivi_view->on_layer;
-		iviscrn = ivilayer->on_screen;
-
 		/*
 		 * If the view is not on the currently rendered scenegraph,
 		 * we do not need to update its properties.
 		 */
-		if (wl_list_empty(&ivi_view->order_link) || !iviscrn)
+		if (!ivi_view_is_mapped(ivi_view))
 			continue;
-
-		/*
-		 * If the view's layer or surface is invisible, we do not need
-		 * to update its properties.
-		 */
-		if (!ivilayer->prop.visibility || !ivisurf->prop.visibility) {
-			/*
-			* If ivilayer or ivisurf of ivi_view is made invisible
-			* in this commit_changes call, we have to damage
-			* the weston_view below this ivi_view. Otherwise content
-			* of this ivi_view will stay visible.
-			*/
-			if ((ivilayer->prop.event_mask | ivisurf->prop.event_mask) &
-			    IVI_NOTIFICATION_VISIBILITY)
-				weston_view_damage_below(ivi_view->view);
-
-			continue;
-		}
 
 		update_prop(ivi_view);
 	}
@@ -706,9 +699,15 @@ commit_surface_list(struct ivi_layout *layout)
 			ivisurf->pending.prop.transition_type = IVI_LAYOUT_TRANSITION_NONE;
 
 			if (configured && !is_surface_transition(ivisurf)) {
-				shell_surface_send_configure(ivisurf->surface,
-							     ivisurf->prop.dest_width,
-							     ivisurf->prop.dest_height);
+				if (weston_surface_is_desktop_surface(ivisurf->surface)) {
+					weston_desktop_surface_set_size(ivisurf->weston_desktop_surface,
+									ivisurf->prop.dest_width,
+									ivisurf->prop.dest_height);
+				} else {
+					shell_surface_send_configure(ivisurf->surface,
+								     ivisurf->prop.dest_width,
+								     ivisurf->prop.dest_height);
+				}
 			}
 		} else {
 			configured = 0;
@@ -780,10 +779,6 @@ commit_screen_list(struct ivi_layout *layout)
 	struct ivi_layout_screen  *iviscrn  = NULL;
 	struct ivi_layout_layer   *ivilayer = NULL;
 	struct ivi_layout_layer   *next     = NULL;
-	struct ivi_layout_view *ivi_view = NULL;
-
-	/* Clear view list of layout ivi_layer */
-	wl_list_init(&layout->layout_layer.view_list.link);
 
 	wl_list_for_each(iviscrn, &layout->screen_list, link) {
 		if (iviscrn->order.dirty) {
@@ -810,7 +805,28 @@ commit_screen_list(struct ivi_layout *layout)
 
 			iviscrn->order.dirty = 0;
 		}
+	}
+}
 
+static void
+build_view_list(struct ivi_layout *layout)
+{
+	struct ivi_layout_screen  *iviscrn;
+	struct ivi_layout_layer   *ivilayer;
+	struct ivi_layout_view   *ivi_view;
+
+	/* If ivi_view is not part of the scenegrapgh, we have to unmap
+	 * weston_views
+	 */
+	wl_list_for_each(ivi_view, &layout->view_list, link) {
+		if (!ivi_view_is_mapped(ivi_view))
+			weston_view_unmap(ivi_view->view);
+	}
+
+	/* Clear view list of layout ivi_layer */
+	wl_list_init(&layout->layout_layer.view_list.link);
+
+	wl_list_for_each(iviscrn, &layout->screen_list, link) {
 		wl_list_for_each(ivilayer, &iviscrn->order.layer_list, order.link) {
 			if (ivilayer->prop.visibility == false)
 				continue;
@@ -963,6 +979,21 @@ ivi_layout_add_listener_configure_surface(struct wl_listener *listener)
 	}
 
 	wl_signal_add(&layout->surface_notification.configure_changed, listener);
+
+	return IVI_SUCCEEDED;
+}
+
+static int32_t
+ivi_layout_add_listener_configure_desktop_surface(struct wl_listener *listener)
+{
+	struct ivi_layout *layout = get_instance();
+
+	if (!listener) {
+		weston_log("ivi_layout_add_listener_configure_desktop_surface: invalid argument\n");
+		return IVI_FAILED;
+	}
+
+	wl_signal_add(&layout->surface_notification.configure_desktop_changed, listener);
 
 	return IVI_SUCCEEDED;
 }
@@ -1751,6 +1782,7 @@ ivi_layout_commit_changes(void)
 	commit_surface_list(layout);
 	commit_layer_list(layout);
 	commit_screen_list(layout);
+	build_view_list(layout);
 
 	commit_transition(layout);
 
@@ -1809,6 +1841,44 @@ ivi_layout_surface_set_transition_duration(struct ivi_layout_surface *ivisurf,
 	return 0;
 }
 
+/*
+ * This interface enables e.g. an id agent to set the id of an ivi-layout
+ * surface, that has been created by a desktop application. This can only be
+ * done once as long as the initial surface id equals IVI_INVALID_ID. Afterwards
+ * two events are emitted, namely surface_created and surface_configured.
+ */
+static int32_t
+ivi_layout_surface_set_id(struct ivi_layout_surface *ivisurf,
+			  uint32_t id_surface)
+{
+	struct ivi_layout *layout = get_instance();
+	struct ivi_layout_surface *search_ivisurf = NULL;
+
+	if (!ivisurf) {
+		weston_log("%s: invalid argument\n", __func__);
+		return IVI_FAILED;
+	}
+
+	if (ivisurf->id_surface != IVI_INVALID_ID) {
+		weston_log("surface id can only be set once\n");
+		return IVI_FAILED;
+	}
+
+	search_ivisurf = get_surface(&layout->surface_list, id_surface);
+	if (search_ivisurf) {
+		weston_log("id_surface(%d) is already created\n", id_surface);
+		return IVI_FAILED;
+	}
+
+	ivisurf->id_surface = id_surface;
+
+	wl_signal_emit(&layout->surface_notification.created, ivisurf);
+	wl_signal_emit(&layout->surface_notification.configure_changed,
+		       ivisurf);
+
+	return IVI_SUCCEEDED;
+}
+
 static int32_t
 ivi_layout_surface_set_transition(struct ivi_layout_surface *ivisurf,
 				  enum ivi_layout_transition_type type,
@@ -1850,20 +1920,8 @@ ivi_layout_surface_dump(struct weston_surface *surface,
  * methods of interaction between ivi-shell with ivi-layout
  */
 
-void
-ivi_layout_surface_configure(struct ivi_layout_surface *ivisurf,
-			     int32_t width, int32_t height)
-{
-	struct ivi_layout *layout = get_instance();
-
-	/* emit callback which is set by ivi-layout api user */
-	wl_signal_emit(&layout->surface_notification.configure_changed,
-		       ivisurf);
-}
-
-struct ivi_layout_surface*
-ivi_layout_surface_create(struct weston_surface *wl_surface,
-			  uint32_t id_surface)
+static struct ivi_layout_surface*
+surface_create(struct weston_surface *wl_surface, uint32_t id_surface)
 {
 	struct ivi_layout *layout = get_instance();
 	struct ivi_layout_surface *ivisurf = NULL;
@@ -1871,14 +1929,6 @@ ivi_layout_surface_create(struct weston_surface *wl_surface,
 	if (wl_surface == NULL) {
 		weston_log("ivi_layout_surface_create: invalid argument\n");
 		return NULL;
-	}
-
-	ivisurf = get_surface(&layout->surface_list, id_surface);
-	if (ivisurf != NULL) {
-		if (ivisurf->surface != NULL) {
-			weston_log("id_surface(%d) is already created\n", id_surface);
-			return NULL;
-		}
 	}
 
 	ivisurf = calloc(1, sizeof *ivisurf);
@@ -1904,7 +1954,54 @@ ivi_layout_surface_create(struct weston_surface *wl_surface,
 
 	wl_list_insert(&layout->surface_list, &ivisurf->link);
 
-	wl_signal_emit(&layout->surface_notification.created, ivisurf);
+	return ivisurf;
+}
+
+void
+ivi_layout_desktop_surface_configure(struct ivi_layout_surface *ivisurf,
+				 int32_t width, int32_t height)
+{
+	struct ivi_layout *layout = get_instance();
+
+	/* emit callback which is set by ivi-layout api user */
+	wl_signal_emit(&layout->surface_notification.configure_desktop_changed,
+		       ivisurf);
+}
+
+struct ivi_layout_surface*
+ivi_layout_desktop_surface_create(struct weston_surface *wl_surface)
+{
+	return surface_create(wl_surface, IVI_INVALID_ID);
+}
+
+void
+ivi_layout_surface_configure(struct ivi_layout_surface *ivisurf,
+			     int32_t width, int32_t height)
+{
+	struct ivi_layout *layout = get_instance();
+
+	/* emit callback which is set by ivi-layout api user */
+	wl_signal_emit(&layout->surface_notification.configure_changed,
+		       ivisurf);
+}
+
+struct ivi_layout_surface*
+ivi_layout_surface_create(struct weston_surface *wl_surface,
+			  uint32_t id_surface)
+{
+	struct ivi_layout *layout = get_instance();
+	struct ivi_layout_surface *ivisurf = NULL;
+
+	ivisurf = get_surface(&layout->surface_list, id_surface);
+	if (ivisurf) {
+		weston_log("id_surface(%d) is already created\n", id_surface);
+		return NULL;
+	}
+
+	ivisurf = surface_create(wl_surface, id_surface);
+
+	if (ivisurf)
+		wl_signal_emit(&layout->surface_notification.created, ivisurf);
 
 	return ivisurf;
 }
@@ -1929,6 +2026,7 @@ ivi_layout_init_with_compositor(struct weston_compositor *ec)
 	wl_signal_init(&layout->surface_notification.created);
 	wl_signal_init(&layout->surface_notification.removed);
 	wl_signal_init(&layout->surface_notification.configure_changed);
+	wl_signal_init(&layout->surface_notification.configure_desktop_changed);
 
 	/* Add layout_layer at the last of weston_compositor.layer_list */
 	weston_layer_init(&layout->layout_layer, ec);
@@ -1957,6 +2055,7 @@ struct ivi_layout_interface ivi_layout_interface = {
 	.add_listener_create_surface	= ivi_layout_add_listener_create_surface,
 	.add_listener_remove_surface	= ivi_layout_add_listener_remove_surface,
 	.add_listener_configure_surface	= ivi_layout_add_listener_configure_surface,
+	.add_listener_configure_desktop_surface	= ivi_layout_add_listener_configure_desktop_surface,
 	.get_surface				= shell_get_ivi_layout_surface,
 	.get_surfaces				= ivi_layout_get_surfaces,
 	.get_id_of_surface			= ivi_layout_get_id_of_surface,
@@ -1971,6 +2070,7 @@ struct ivi_layout_interface ivi_layout_interface = {
 	.surface_get_weston_surface		= ivi_layout_surface_get_weston_surface,
 	.surface_set_transition			= ivi_layout_surface_set_transition,
 	.surface_set_transition_duration	= ivi_layout_surface_set_transition_duration,
+	.surface_set_id				= ivi_layout_surface_set_id,
 
 	/**
 	 * layer controller interfaces

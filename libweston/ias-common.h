@@ -124,6 +124,7 @@ struct ias_output {
 	struct wl_list link;
 	struct backlight *backlight;
 	struct ias_crtc *ias_crtc;
+	struct weston_head head;
 	int32_t width;
 	int32_t height;
 	int32_t rotation;
@@ -182,17 +183,19 @@ struct ias_output {
 
 	struct wl_signal printfps_signal;
 	struct wl_listener printfps_listener;
+	int32_t flip_count;
+	uint32_t prev_time_ms;
 
-#if defined(BUILD_VAAPI_RECORDER) || defined(BUILD_FRAME_CAPTURE)
+#if defined(BUILD_VAAPI_RECORDER) || defined(BUILD_REMOTE_DISPLAY)
 	struct wl_signal next_scanout_ready_signal;
 #endif
-#ifdef BUILD_FRAME_CAPTURE
+#ifdef BUILD_REMOTE_DISPLAY
 	struct capture_proxy *cp;
 	struct wl_listener capture_proxy_frame_listener;
 #endif
 };
 
-#ifdef BUILD_FRAME_CAPTURE
+#ifdef BUILD_REMOTE_DISPLAY
 struct ias_surface_capture {
 	struct wl_list link;
 	struct capture_proxy *cp;
@@ -281,7 +284,7 @@ struct ias_backend {
 	void (*get_tex_info)(struct weston_view *view, int *num, GLuint *names);
 	void (*get_egl_image_info)(struct weston_view *view, int *num, EGLImageKHR *names);
 	void (*set_viewport)(int x, int y, int width, int height);
-#if BUILD_FRAME_CAPTURE
+#if BUILD_REMOTE_DISPLAY
 	int (*start_capture)(struct wl_client *client,
 			struct ias_backend *ias_backend, struct wl_resource *resource,
 			struct weston_surface *surface, uint32_t output_number,
@@ -292,6 +295,8 @@ struct ias_backend {
 	int (*release_buffer_handle)(struct ias_backend *ias_backend,
 			uint32_t surfid, uint32_t bufid, uint32_t imageid,
 			struct weston_surface *surface, uint32_t output_number);
+	int (*change_capture_output)(struct ias_backend *ias_backend,
+			struct weston_surface *surface);
 
 	struct wl_list capture_proxy_list;
 #endif

@@ -28,7 +28,7 @@
  * surface and layer which groups surfaces. A unique ID whose type is integer is
  * required to create surface and layer. With the unique ID, surface and layer
  * are identified to control them. The API set consists of APIs to control
- * properties of surface and layers about followings,
+ * properties of surface and layers about the following:
  * - visibility.
  * - opacity.
  * - clipping (x,y,width,height).
@@ -56,6 +56,7 @@ extern "C" {
 #endif /* __cplusplus */
 
 #include <stdint.h>
+#include <limits.h>
 
 #include "stdbool.h"
 #include "compositor.h"
@@ -63,6 +64,7 @@ extern "C" {
 
 #define IVI_SUCCEEDED (0)
 #define IVI_FAILED (-1)
+#define IVI_INVALID_ID UINT_MAX
 
 struct ivi_layout_layer;
 struct ivi_layout_screen;
@@ -189,6 +191,16 @@ struct ivi_layout_interface {
 	int32_t (*add_listener_configure_surface)(struct wl_listener *listener);
 
 	/**
+	 * \brief add a listener for notification when desktop_surface is configured
+	 *
+	 * When an desktop_surface is configured, a signal is emitted
+	 * to the listening controller plugins.
+	 * The pointer of the configured desktop_surface is sent as the void *data argument
+	 * to the wl_listener::notify callback function of the listener.
+	 */
+	int32_t (*add_listener_configure_desktop_surface)(struct wl_listener *listener);
+
+	/**
 	 * \brief Get all ivi_surfaces which are currently registered and managed
 	 * by the services
 	 *
@@ -311,6 +323,12 @@ struct ivi_layout_interface {
 	int32_t (*surface_set_transition_duration)(
 					struct ivi_layout_surface *ivisurf,
 					uint32_t duration);
+
+	/**
+	 * \brief set id of ivi_layout_surface
+	 */
+	int32_t (*surface_set_id)(struct ivi_layout_surface *ivisurf,
+				  uint32_t id_surface);
 
 	/**
 	 * layer controller interface
@@ -536,7 +554,7 @@ struct ivi_layout_interface {
 					   const int32_t number);
 
 	/**
-	 * transision animation for layer
+	 * transition animation for layer
 	 */
 	void (*transition_move_layer_cancel)(struct ivi_layout_layer *layer);
 	int32_t (*layer_set_fade_info)(struct ivi_layout_layer* ivilayer,

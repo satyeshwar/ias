@@ -75,8 +75,7 @@ open_config_file(struct weston_config *c, const char *name)
 	}
 
 	/* Precedence is given to config files in the home directory,
-	 * and then to directories listed in XDG_CONFIG_DIRS and
-	 * finally to the current working directory. */
+	 * then to directories listed in XDG_CONFIG_DIRS. */
 
 	/* $XDG_CONFIG_HOME */
 	if (config_dir) {
@@ -111,10 +110,7 @@ open_config_file(struct weston_config *c, const char *name)
 			next++;
 	}
 
-	/* Current working directory. */
-	snprintf(c->path, sizeof c->path, "./%s", name);
-
-	return open(c->path, O_RDONLY | O_CLOEXEC);
+	return -1;
 }
 
 static struct weston_config_entry *
@@ -332,17 +328,6 @@ weston_config_section_get_bool(struct weston_config_section *section,
 
 WL_EXPORT
 const char *
-weston_config_get_libexec_dir(void)
-{
-	const char *path = getenv("WESTON_BUILD_DIR");
-
-	if (path)
-		return path;
-
-	return LIBEXECDIR;
-}
-
-const char *
 weston_config_get_name_from_env(void)
 {
 	const char *name;
@@ -403,6 +388,7 @@ section_add_entry(struct weston_config_section *section,
 	return entry;
 }
 
+WL_EXPORT
 struct weston_config *
 weston_config_parse(const char *name)
 {

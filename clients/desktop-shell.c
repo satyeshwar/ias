@@ -736,7 +736,8 @@ panel_add_launcher(struct panel *panel, const char *icon, const char *path)
 enum {
 	BACKGROUND_SCALE,
 	BACKGROUND_SCALE_CROP,
-	BACKGROUND_TILE
+	BACKGROUND_TILE,
+	BACKGROUND_CENTERED
 };
 
 static void
@@ -756,7 +757,10 @@ background_draw(struct widget *widget, void *data)
 
 	cr = widget_cairo_create(background->widget);
 	cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
-	cairo_set_source_rgba(cr, 0.0, 0.0, 0.2, 1.0);
+	if (background->color == 0)
+		cairo_set_source_rgba(cr, 0.0, 0.0, 0.2, 1.0);
+	else
+		set_hex_color(cr, background->color);
 	cairo_paint(cr);
 
 	widget_get_allocation(widget, &allocation);
@@ -797,16 +801,27 @@ background_draw(struct widget *widget, void *data)
 		case BACKGROUND_TILE:
 			cairo_pattern_set_extend(pattern, CAIRO_EXTEND_REPEAT);
 			break;
+		case BACKGROUND_CENTERED:
+			s = (sx < sy) ? sx : sy;
+			if (s < 1.0)
+				s = 1.0;
+
+			/* align center */
+			tx = (im_w - s * allocation.width) * 0.5;
+			ty = (im_h - s * allocation.height) * 0.5;
+
+			cairo_matrix_init_translate(&matrix, tx, ty);
+			cairo_matrix_scale(&matrix, s, s);
+			cairo_pattern_set_matrix(pattern, &matrix);
+			break;
 		}
 
 		cairo_set_source(cr, pattern);
 		cairo_pattern_destroy (pattern);
 		cairo_surface_destroy(image);
-	} else {
-		set_hex_color(cr, background->color);
+		cairo_mask(cr, pattern);
 	}
 
-	cairo_paint(cr);
 	cairo_destroy(cr);
 	cairo_surface_destroy(surface);
 
@@ -1142,6 +1157,8 @@ background_create(struct desktop *desktop, struct output *output)
 		background->type = BACKGROUND_SCALE_CROP;
 	} else if (strcmp(type, "tile") == 0) {
 		background->type = BACKGROUND_TILE;
+	} else if (strcmp(type, "centered") == 0) {
+		background->type = BACKGROUND_CENTERED;
 	} else {
 		background->type = -1;
 		fprintf(stderr, "invalid background-type: %s\n",
@@ -1337,19 +1354,30 @@ output_remove(struct desktop *desktop, struct output *output)
 	}
 
 	if (rep) {
-		/* If found, hand over the background and panel so they don't
-		 * get destroyed. */
-		assert(!rep->background);
-		assert(!rep->panel);
+		/* If found and it does not already have a background or panel,
+		 * hand over the background and panel so they don't get
+		 * destroyed.
+		 *
+		 * We never create multiple backgrounds or panels for clones,
+		 * but if the compositor moves outputs, a pair of wl_outputs
+		 * might become "clones". This may happen temporarily when
+		 * an output is about to be removed and the rest are reflowed.
+		 * In this case it is correct to let the background/panel be
+		 * destroyed.
+		 */
 
-		rep->background = output->background;
-		output->background = NULL;
-		rep->background->owner = rep;
+		if (!rep->background) {
+			rep->background = output->background;
+			output->background = NULL;
+			rep->background->owner = rep;
+		}
 
-		rep->panel = output->panel;
-		output->panel = NULL;
-		if (rep->panel)
-			rep->panel->owner = rep;
+		if (!rep->panel) {
+			rep->panel = output->panel;
+			output->panel = NULL;
+			if (rep->panel)
+				rep->panel->owner = rep;
+		}
 	}
 
 	output_destroy(output);

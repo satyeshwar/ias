@@ -1,6 +1,8 @@
 /*
  * Copyright © 2010 Intel Corporation
  * Copyright © 2013 Jonas Ådahl
+ * Copyright 2017-2018 Collabora, Ltd.
+ * Copyright 2017-2018 General Electric Company
  *
  * Permission is hereby granted, free of charge, to any person obtaining
  * a copy of this software and associated documentation files (the
@@ -296,6 +298,118 @@ handle_pointer_axis(struct libinput_device *libinput_device,
 	return true;
 }
 
+static struct weston_output *
+touch_get_output(struct weston_touch_device *device)
+{
+	struct evdev_device *evdev_device = device->backend_data;
+
+	return evdev_device->output;
+}
+
+static const char *
+touch_get_calibration_head_name(struct weston_touch_device *device)
+{
+	struct evdev_device *evdev_device = device->backend_data;
+	struct weston_output *output = evdev_device->output;
+	struct weston_head *head;
+
+	if (!output)
+		return NULL;
+
+	assert(output->enabled);
+	if (evdev_device->output_name)
+		return evdev_device->output_name;
+
+	/* No specific head was configured, so the association was made by
+	 * the default rule. Just grab whatever head's name.
+	 */
+	wl_list_for_each(head, &output->head_list, output_link)
+		return head->name;
+
+	assert(0);
+	return NULL;
+}
+
+static void
+touch_get_calibration(struct weston_touch_device *device,
+		      struct weston_touch_device_matrix *cal)
+{
+	struct evdev_device *evdev_device = device->backend_data;
+
+	libinput_device_config_calibration_get_matrix(evdev_device->device,
+						      cal->m);
+}
+
+static void
+do_set_calibration(struct evdev_device *evdev_device,
+		   const struct weston_touch_device_matrix *cal)
+{
+	enum libinput_config_status status;
+
+	weston_log("input device %s: applying calibration:\n",
+		   libinput_device_get_sysname(evdev_device->device));
+	weston_log_continue(STAMP_SPACE "  %f %f %f\n",
+			    cal->m[0], cal->m[1], cal->m[2]);
+	weston_log_continue(STAMP_SPACE "  %f %f %f\n",
+			    cal->m[3], cal->m[4], cal->m[5]);
+
+	status = libinput_device_config_calibration_set_matrix(evdev_device->device,
+							       cal->m);
+	if (status != LIBINPUT_CONFIG_STATUS_SUCCESS)
+		weston_log("Error: Failed to apply calibration.\n");
+}
+
+static void
+touch_set_calibration(struct weston_touch_device *device,
+		      const struct weston_touch_device_matrix *cal)
+{
+	struct evdev_device *evdev_device = device->backend_data;
+
+	/* Stop output hotplug from reloading the WL_CALIBRATION values.
+	 * libinput will maintain the latest calibration for us.
+	 */
+	evdev_device->override_wl_calibration = true;
+
+	do_set_calibration(evdev_device, cal);
+}
+
+static const struct weston_touch_device_ops touch_calibration_ops = {
+	.get_output = touch_get_output,
+	.get_calibration_head_name = touch_get_calibration_head_name,
+	.get_calibration = touch_get_calibration,
+	.set_calibration = touch_set_calibration
+};
+
+static struct weston_touch_device *
+create_touch_device(struct evdev_device *device)
+{
+	const struct weston_touch_device_ops *ops = NULL;
+	struct weston_touch_device *touch_device;
+	struct udev_device *udev_device;
+
+	if (libinput_device_config_calibration_has_matrix(device->device))
+		ops = &touch_calibration_ops;
+
+	udev_device = libinput_device_get_udev_device(device->device);
+	if (!udev_device)
+		return NULL;
+
+	touch_device = weston_touch_create_touch_device(device->seat->touch_state,
+					udev_device_get_syspath(udev_device),
+					device, ops);
+
+	udev_device_unref(udev_device);
+
+	if (!touch_device)
+		return NULL;
+
+	weston_log("Touchscreen - %s - %s\n",
+		   libinput_device_get_name(device->device),
+		   touch_device->syspath);
+
+	return touch_device;
+}
+
 static void
 handle_touch_with_coords(struct libinput_device *libinput_device,
 			 struct libinput_event_touch *touch_event,
@@ -305,6 +419,7 @@ handle_touch_with_coords(struct libinput_device *libinput_device,
 		libinput_device_get_user_data(libinput_device);
 	double x;
 	double y;
+	struct weston_point2d_device_normalized norm;
 	uint32_t width, height;
 	struct timespec time;
 	int32_t slot;
@@ -324,7 +439,14 @@ handle_touch_with_coords(struct libinput_device *libinput_device,
 	weston_output_transform_coordinate(device->output,
 					   x, y, &x, &y);
 
-	notify_touch(device->seat, &time, slot, x, y, touch_type);
+	if (weston_touch_device_can_calibrate(device->touch_device)) {
+		norm.x = libinput_event_touch_get_x_transformed(touch_event, 1);
+		norm.y = libinput_event_touch_get_y_transformed(touch_event, 1);
+		notify_touch_normalized(device->touch_device, &time, slot,
+					x, y, &norm, touch_type);
+	} else {
+		notify_touch(device->touch_device, &time, slot, x, y, touch_type);
+	}
 }
 
 static void
@@ -353,7 +475,7 @@ handle_touch_up(struct libinput_device *libinput_device,
 	timespec_from_usec(&time,
 			   libinput_event_touch_get_time_usec(touch_event));
 
-	notify_touch(device->seat, &time, slot, 0, 0, WL_TOUCH_UP);
+	notify_touch(device->touch_device, &time, slot, 0, 0, WL_TOUCH_UP);
 }
 
 static void
@@ -362,9 +484,8 @@ handle_touch_frame(struct libinput_device *libinput_device,
 {
 	struct evdev_device *device =
 		libinput_device_get_user_data(libinput_device);
-	struct weston_seat *seat = device->seat;
 
-	notify_touch_frame(seat);
+	notify_touch_frame(device->touch_device);
 }
 
 int
@@ -434,16 +555,8 @@ notify_output_destroy(struct wl_listener *listener, void *data)
 	struct evdev_device *device =
 		container_of(listener,
 			     struct evdev_device, output_destroy_listener);
-	struct weston_compositor *c = device->seat->compositor;
-	struct weston_output *output;
 
-	if (!device->output_name && !wl_list_empty(&c->output_list)) {
-		output = container_of(c->output_list.next,
-				      struct weston_output, link);
-		evdev_device_set_output(device, output);
-	} else {
-		device->output = NULL;
-	}
+	evdev_device_set_output(device, NULL);
 }
 
 /**
@@ -460,22 +573,35 @@ evdev_device_set_calibration(struct evdev_device *device)
 	const char *sysname = libinput_device_get_sysname(device->device);
 	const char *calibration_values;
 	uint32_t width, height;
-	float calibration[6];
-	enum libinput_config_status status;
+	struct weston_touch_device_matrix calibration;
 
-	if (!device->output)
+	if (!libinput_device_config_calibration_has_matrix(device->device))
 		return;
+
+	/* If LIBINPUT_CALIBRATION_MATRIX was set to non-identity, we will not
+	 * override it with WL_CALIBRATION. It also means we don't need an
+	 * output to load a calibration. */
+	if (libinput_device_config_calibration_get_default_matrix(
+							  device->device,
+							  calibration.m) != 0)
+		return;
+
+	/* touch_set_calibration() has updated the values, do not load old
+	 * values from WL_CALIBRATION.
+	 */
+	if (device->override_wl_calibration)
+		return;
+
+	if (!device->output) {
+		weston_log("input device %s has no enabled output associated "
+			   "(%s named), skipping calibration for now.\n",
+			   sysname, device->output_name ?: "none");
+		return;
+	}
 
 	width = device->output->width;
 	height = device->output->height;
 	if (width == 0 || height == 0)
-		return;
-
-	/* If libinput has a pre-set calibration matrix, don't override it */
-	if (!libinput_device_config_calibration_has_matrix(device->device) ||
-	    libinput_device_config_calibration_get_default_matrix(
-							  device->device,
-							  calibration) != 0)
 		return;
 
 	udev = udev_new();
@@ -492,37 +618,35 @@ evdev_device_set_calibration(struct evdev_device *device)
 		udev_device_get_property_value(udev_device,
 					       "WL_CALIBRATION");
 
+	if (calibration_values) {
+		weston_log("Warning: input device %s has WL_CALIBRATION property set. "
+			   "Support for it will be removed in the future. "
+			   "Please use LIBINPUT_CALIBRATION_MATRIX instead.\n",
+			   sysname);
+	}
+
 	if (!calibration_values || sscanf(calibration_values,
 					  "%f %f %f %f %f %f",
-					  &calibration[0],
-					  &calibration[1],
-					  &calibration[2],
-					  &calibration[3],
-					  &calibration[4],
-					  &calibration[5]) != 6)
+					  &calibration.m[0],
+					  &calibration.m[1],
+					  &calibration.m[2],
+					  &calibration.m[3],
+					  &calibration.m[4],
+					  &calibration.m[5]) != 6)
 		goto out;
-
-	weston_log("Applying calibration: %f %f %f %f %f %f "
-		   "(normalized %f %f)\n",
-		    calibration[0],
-		    calibration[1],
-		    calibration[2],
-		    calibration[3],
-		    calibration[4],
-		    calibration[5],
-		    calibration[2] / width,
-		    calibration[5] / height);
 
 	/* normalize to a format libinput can use. There is a chance of
 	   this being wrong if the width/height don't match the device
 	   width/height but I'm not sure how to fix that */
-	calibration[2] /= width;
-	calibration[5] /= height;
+	calibration.m[2] /= width;
+	calibration.m[5] /= height;
 
-	status = libinput_device_config_calibration_set_matrix(device->device,
-							       calibration);
-	if (status != LIBINPUT_CONFIG_STATUS_SUCCESS)
-		weston_log("Failed to apply calibration.\n");
+	do_set_calibration(device, &calibration);
+
+	weston_log_continue(STAMP_SPACE "  raw translation %f %f for output %s\n",
+		   calibration.m[2] * width,
+		   calibration.m[5] * height,
+		   device->output->name);
 
 out:
 	if (udev_device)
@@ -534,10 +658,27 @@ void
 evdev_device_set_output(struct evdev_device *device,
 			struct weston_output *output)
 {
+	if (device->output == output)
+		return;
+
 	if (device->output_destroy_listener.notify) {
 		wl_list_remove(&device->output_destroy_listener.link);
 		device->output_destroy_listener.notify = NULL;
 	}
+
+	if (!output) {
+		weston_log("output for input device %s removed\n",
+			   libinput_device_get_sysname(device->device));
+
+		device->output = NULL;
+		return;
+	}
+
+	weston_log("associating input device %s with output %s "
+		   "(%s by udev)\n",
+		   libinput_device_get_sysname(device->device),
+		   output->name,
+		   device->output_name ?: "none");
 
 	device->output = output;
 	device->output_destroy_listener.notify = notify_output_destroy;
@@ -574,6 +715,7 @@ evdev_device_create(struct libinput_device *libinput_device,
 					   LIBINPUT_DEVICE_CAP_TOUCH)) {
 		weston_seat_init_touch(seat);
 		device->seat_caps |= EVDEV_SEAT_TOUCH;
+		device->touch_device = create_touch_device(device);
 	}
 
 	libinput_device_set_user_data(libinput_device, device);
@@ -589,14 +731,15 @@ evdev_device_destroy(struct evdev_device *device)
 		weston_seat_release_pointer(device->seat);
 	if (device->seat_caps & EVDEV_SEAT_KEYBOARD)
 		weston_seat_release_keyboard(device->seat);
-	if (device->seat_caps & EVDEV_SEAT_TOUCH)
+	if (device->seat_caps & EVDEV_SEAT_TOUCH) {
+		weston_touch_device_destroy(device->touch_device);
 		weston_seat_release_touch(device->seat);
+	}
 
 	if (device->output)
 		wl_list_remove(&device->output_destroy_listener.link);
 	wl_list_remove(&device->link);
 	libinput_device_unref(device->device);
-	free(device->devnode);
 	free(device->output_name);
 	free(device);
 }

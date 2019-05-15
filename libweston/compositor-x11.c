@@ -62,6 +62,7 @@
 #include "pixman-renderer.h"
 #include "presentation-time-server-protocol.h"
 #include "linux-dmabuf.h"
+#include "linux-explicit-synchronization.h"
 #include "windowed-output-api.h"
 
 #define DEFAULT_AXIS_STEP_DISTANCE 10
@@ -116,6 +117,10 @@ struct x11_backend {
 	} atom;
 };
 
+struct x11_head {
+	struct weston_head	base;
+};
+
 struct x11_output {
 	struct weston_output	base;
 
@@ -141,6 +146,12 @@ struct window_delete_data {
 };
 
 struct gl_renderer_interface *gl_renderer;
+
+static inline struct x11_head *
+to_x11_head(struct weston_head *base)
+{
+	return container_of(base, struct x11_head, base);
+}
 
 static inline struct x11_output *
 to_x11_output(struct weston_output *base)
@@ -839,7 +850,8 @@ x11_output_switch_mode(struct weston_output *base, struct weston_mode *mode)
 			return -1;
 		}
 
-		if (pixman_renderer_output_create(&output->base) < 0) {
+		if (pixman_renderer_output_create(&output->base,
+				PIXMAN_RENDERER_OUTPUT_USE_SHADOW) < 0) {
 			weston_log("Failed to create pixman renderer for output\n");
 			x11_output_deinit_shm(b, output);
 			return -1;
@@ -1011,7 +1023,8 @@ x11_output_enable(struct weston_output *base)
 			weston_log("Failed to initialize SHM for the X11 output\n");
 			goto err;
 		}
-		if (pixman_renderer_output_create(&output->base) < 0) {
+		if (pixman_renderer_output_create(&output->base,
+				PIXMAN_RENDERER_OUTPUT_USE_SHADOW) < 0) {
 			weston_log("Failed to create pixman renderer for output\n");
 			x11_output_deinit_shm(b, output);
 			goto err;
@@ -1065,6 +1078,8 @@ x11_output_set_size(struct weston_output *base, int width, int height)
 {
 	struct x11_output *output = to_x11_output(base);
 	struct x11_backend *b = to_x11_backend(base->compositor);
+	struct weston_head *head;
+	xcb_screen_t *scrn = b->screen;
 	int output_width, output_height;
 
 	/* We can only be called once. */
@@ -1085,6 +1100,13 @@ x11_output_set_size(struct weston_output *base, int width, int height)
 		return -1;
 	}
 
+	wl_list_for_each(head, &output->base.head_list, output_link) {
+		weston_head_set_monitor_strings(head, "weston-X11", "none", NULL);
+		weston_head_set_physical_size(head,
+			width * scrn->width_in_millimeters / scrn->width_in_pixels,
+			height * scrn->height_in_millimeters / scrn->height_in_pixels);
+	}
+
 	output_width = width * output->base.scale;
 	output_height = height * output->base.scale;
 
@@ -1099,23 +1121,14 @@ x11_output_set_size(struct weston_output *base, int width, int height)
 	wl_list_insert(&output->base.mode_list, &output->mode.link);
 
 	output->base.current_mode = &output->mode;
-	output->base.make = "weston-X11";
-	output->base.model = "none";
-
 	output->base.native_mode = &output->native;
 	output->base.native_scale = output->base.scale;
-
-	output->base.mm_width = width * b->screen->width_in_millimeters /
-		b->screen->width_in_pixels;
-	output->base.mm_height = height * b->screen->height_in_millimeters /
-		b->screen->height_in_pixels;
 
 	return 0;
 }
 
-static int
-x11_output_create(struct weston_compositor *compositor,
-		  const char *name)
+static struct weston_output *
+x11_output_create(struct weston_compositor *compositor, const char *name)
 {
 	struct x11_output *output;
 
@@ -1123,20 +1136,44 @@ x11_output_create(struct weston_compositor *compositor,
 	assert(name);
 
 	output = zalloc(sizeof *output);
-	if (output == NULL) {
-		perror("zalloc");
-		return -1;
-	}
+	if (!output)
+		return NULL;
 
 	weston_output_init(&output->base, compositor, name);
 
 	output->base.destroy = x11_output_destroy;
 	output->base.disable = x11_output_disable;
 	output->base.enable = x11_output_enable;
+	output->base.attach_head = NULL;
 
 	weston_compositor_add_pending_output(&output->base, compositor);
 
+	return &output->base;
+}
+
+static int
+x11_head_create(struct weston_compositor *compositor, const char *name)
+{
+	struct x11_head *head;
+
+	assert(name);
+
+	head = zalloc(sizeof *head);
+	if (!head)
+		return -1;
+
+	weston_head_init(&head->base, name);
+	weston_head_set_connection_status(&head->base, true);
+	weston_compositor_add_head(compositor, &head->base);
+
 	return 0;
+}
+
+static void
+x11_head_destroy(struct x11_head *head)
+{
+	weston_head_release(&head->base);
+	free(head);
 }
 
 static struct x11_output *
@@ -1746,11 +1783,15 @@ static void
 x11_destroy(struct weston_compositor *ec)
 {
 	struct x11_backend *backend = to_x11_backend(ec);
+	struct weston_head *base, *next;
 
 	wl_event_source_remove(backend->xcb_source);
 	x11_input_destroy(backend);
 
 	weston_compositor_shutdown(ec); /* destroys outputs, too */
+
+	wl_list_for_each_safe(base, next, &ec->head_list, compositor_link)
+		x11_head_destroy(to_x11_head(base));
 
 	XCloseDisplay(backend->dpy);
 	free(backend);
@@ -1775,7 +1816,7 @@ init_gl_renderer(struct x11_backend *b)
 
 static const struct weston_windowed_output_api api = {
 	x11_output_set_size,
-	x11_output_create,
+	x11_head_create,
 };
 
 static struct x11_backend *
@@ -1834,6 +1875,7 @@ x11_backend_create(struct weston_compositor *compositor,
 	weston_log("Using %s renderer\n", config->use_pixman ? "pixman" : "gl");
 
 	b->base.destroy = x11_destroy;
+	b->base.create_output = x11_output_create;
 
 	if (x11_input_create(b, config->no_input) < 0) {
 		weston_log("Failed to create X11 input\n");
@@ -1852,6 +1894,12 @@ x11_backend_create(struct weston_compositor *compositor,
 		if (linux_dmabuf_setup(compositor) < 0)
 			weston_log("Error: initializing dmabuf "
 				   "support failed.\n");
+	}
+
+	if (compositor->capabilities & WESTON_CAP_EXPLICIT_SYNC) {
+		if (linux_explicit_synchronization_setup(compositor) < 0)
+			weston_log("Error: initializing explicit "
+				   " synchronization support failed.\n");
 	}
 
 	ret = weston_plugin_api_register(compositor, WESTON_WINDOWED_OUTPUT_API_NAME,

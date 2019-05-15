@@ -40,6 +40,7 @@
 #include "ias-hmi.h"
 #include "ias-relay-input.h"
 #include "ias-shell.h"
+#include "shared/helpers.h"
 
 #define TARGET_NUM_SECONDS 5
 
@@ -48,7 +49,6 @@ static struct ias_shell *self;
 static void (*renderer_attach)(struct weston_surface *es, struct weston_buffer *buffer);
 
 static struct timeval curr_time;
-static uint32_t prev_time_ms;
 
 /*
  * Custom zorder (layer).
@@ -123,13 +123,12 @@ int ias_surface_is_flipped(struct ias_surface *shsurf)
 	if (shsurf->view->plane) {
 		if (shsurf->view->plane != primary_plane) {
 			ret = 1;
-                }
-        }
-	else if (output && output->scanout_surface) {
+		}
+	} else if (output && output->scanout_surface) {
 		if (shsurf->surface == output->scanout_surface) {
 			ret = 1;
-                }
-        }
+		}
+	}
 	return ret;
 }
 /***
@@ -213,7 +212,8 @@ ias_surface_set_fullscreen(struct wl_client *client,
 	struct weston_frame_callback *cb, *cnext;
 
 	if (output_resource) {
-		shsurf->output = output_resource->data;
+		shsurf->output =
+			weston_head_from_resource(output_resource)->output;
 	} else {
 		shsurf->output = get_default_output(shsurf->shell->compositor);
 	}
@@ -224,8 +224,8 @@ ias_surface_set_fullscreen(struct wl_client *client,
 				shsurf->output->x,
 				shsurf->output->y);
 		send_configure(shsurf->surface,
-						   shsurf->output->width,
-						   shsurf->output->height);
+				shsurf->output->width,
+				shsurf->output->height);
 	}
 
 	/*
@@ -385,7 +385,7 @@ shell_surface_set_maximized(struct wl_client *client,
 
 	/* Output is optional; if unset, the default (primary) output is used */
 	if (output_resource) {
-		output = (struct weston_output *)output_resource->data;
+		output = weston_head_from_resource(output_resource)->output;
 	} else {
 		output = get_default_output(shsurf->surface->compositor);
 	}
@@ -512,7 +512,7 @@ ias_shell_set_background(struct wl_client *client,
 	wl_list_insert(&shsurf->shell->background_surfaces, &shsurf->special_link);
 
 	/* Assign the surface to the output that it will be the background for */
-	shsurf->output = output_resource->data;
+	shsurf->output = weston_head_from_resource(output_resource)->output;
 
 	/*
 	 * Reposition background surface at upper left of output in case the
@@ -626,7 +626,7 @@ ias_shell_popup(struct wl_client *client,
 	shsurf->popup.priority = priority;
 
 	/* Assign the surface to the output that the popup is for */
-	shsurf->output = output_resource->data;
+	shsurf->output = weston_head_from_resource(output_resource)->output;
 
 	/*
 	 * Figure out whether this surface is high enough priority to set as
@@ -871,16 +871,16 @@ ias_shell_get_ias_surface_internal(struct wl_client *client,
 	if (!wl_surface) {
 		/* Setup resource data from shell surface */
 		shsurf->resource = wl_resource_create(client,
-							&ias_surface_interface, 1, id);
+				&ias_surface_interface, 1, id);
 		wl_resource_set_implementation(shsurf->resource,
-							&ias_surface_implementation,
-							shsurf, destroy_ias_surface_resource);
+				&ias_surface_implementation,
+				shsurf, destroy_ias_surface_resource);
 	} else {
 		shsurf->resource = wl_resource_create(client,
-							&wl_shell_surface_interface, 1, id);
+				&wl_shell_surface_interface, 1, id);
 		wl_resource_set_implementation(shsurf->resource,
-							&shell_surface_implementation,
-							shsurf, destroy_ias_surface_resource);
+				&shell_surface_implementation,
+				shsurf, destroy_ias_surface_resource);
 		shsurf->wl_shell_interface = 1;
 	}
 
@@ -1065,7 +1065,7 @@ bind_ias_shell(struct wl_client *client,
 	resource = wl_resource_create(client, &ias_shell_interface, 1, id);
 	if (resource) {
 		wl_resource_set_implementation(resource, &ias_shell_implementation,
-						shell, unbind_ias_shell);
+				shell, unbind_ias_shell);
 	}
 
 	/* Check if client is bound to wl_shell interface */
@@ -1093,7 +1093,7 @@ bind_ias_shell(struct wl_client *client,
 		hmi_client = wl_resource_create(client, &ias_shell_interface, 1, id);
 		if (hmi_client) {
 			wl_resource_set_implementation(hmi_client, &ias_shell_implementation,
-							shell, NULL);
+					shell, NULL);
 		}
 		self->hmi.ias_shell = hmi_client;
 	}
@@ -1276,6 +1276,7 @@ ias_surface_destructor(struct ias_surface *shsurf)
 	struct ias_shell *shell = shsurf->shell;
 	struct ias_surface *child;
 	struct hmi_callback *cb;
+	struct frame_data *fd, *fd_tmp;
 
 	/* remove destroyed surface from prev_focus_list */
 	surface_remove_prev_focus_list(shsurf, shell);
@@ -1285,9 +1286,9 @@ ias_surface_destructor(struct ias_surface *shsurf)
 	/* Notify ias_hmi listeners of the surface destruction */
 	wl_list_for_each(cb, &shell->sfc_change_callbacks, link) {
 		ias_hmi_send_surface_destroyed(cb->resource, SURFPTR2ID(shsurf),
-			shsurf->title,
-			shsurf->pid,
-			shsurf->pname);
+				shsurf->title,
+				shsurf->pid,
+				shsurf->pname);
 	}
 
 	/* Remove ourselves from the surface's destructor list */
@@ -1324,8 +1325,8 @@ ias_surface_destructor(struct ias_surface *shsurf)
 	if (shsurf->next_zorder == SHELL_SURFACE_ZORDER_POPUP) {
 		struct ias_surface *top_popup;
 		top_popup = wl_list_first(&shell->popup_surfaces,
-			struct ias_surface,
-			special_link);
+				struct ias_surface,
+				special_link);
 
 		if (top_popup) {
 			top_popup->next_behavior &= ~SHELL_SURFACE_BEHAVIOR_HIDDEN;
@@ -1333,6 +1334,11 @@ ias_surface_destructor(struct ias_surface *shsurf)
 			/* Call configure to make the behavior change take effect. */
 			ias_committed(top_popup->surface, 0, 0);
 		}
+	}
+
+	wl_list_for_each_safe(fd, fd_tmp, &shsurf->output_list, output_link) {
+		wl_list_remove(&fd->output_link);
+		free(fd);
 	}
 
 	/*
@@ -1368,7 +1374,7 @@ handle_surface_destroy(struct wl_listener *listener, void *data)
 		wl_resource_destroy(shsurf->resource);
 	} else {
 		wl_signal_emit(&shsurf->destroy_signal,
-				   shsurf->resource);
+				shsurf->resource);
 		ias_surface_destructor(shsurf);
 	}
 }
@@ -1385,6 +1391,8 @@ ias_surface_constructor(void *shellptr,
 {
 	struct ias_shell *shell = shellptr;
 	struct ias_surface *shsurf;
+	struct weston_output *output;
+	struct frame_data *fd;
 
 	/*
 	 * Make sure no shell surface has already been created for this
@@ -1436,6 +1444,14 @@ ias_surface_constructor(void *shellptr,
 	wl_list_init(&shsurf->special_link);
 
 	wl_list_init(&shsurf->surface_link);
+	wl_list_init(&shsurf->output_list);
+
+	wl_list_for_each(output, &surface->compositor->output_list, link) {
+		fd = calloc(1, sizeof *fd);
+		fd->output_id = output->id;
+		wl_list_init(&fd->output_link);
+		wl_list_insert(&shsurf->output_list, &fd->output_link);
+	}
 
 	/*
 	 * Initialize process id and name for the client app associated with this
@@ -1506,14 +1522,14 @@ static int
 ias_zorder_to_weston_layer_position(uint32_t zorder)
 {
 	switch(zorder) {
-	case SHELL_SURFACE_ZORDER_BACKGROUND:
-		return WESTON_LAYER_POSITION_BACKGROUND;
-	case SHELL_SURFACE_ZORDER_FULLSCREEN:
-		return WESTON_LAYER_POSITION_FULLSCREEN;
-	case SHELL_SURFACE_ZORDER_POPUP:
-		return WESTON_LAYER_POSITION_TOP_UI;
-	default:
-		return WESTON_LAYER_POSITION_NORMAL + zorder;
+		case SHELL_SURFACE_ZORDER_BACKGROUND:
+			return WESTON_LAYER_POSITION_BACKGROUND;
+		case SHELL_SURFACE_ZORDER_FULLSCREEN:
+			return WESTON_LAYER_POSITION_FULLSCREEN;
+		case SHELL_SURFACE_ZORDER_POPUP:
+			return WESTON_LAYER_POSITION_TOP_UI;
+		default:
+			return WESTON_LAYER_POSITION_NORMAL + zorder;
 	}
 }
 
@@ -1679,34 +1695,34 @@ map(struct ias_shell *shell,
 
 	/* Perform extra handling for special zorders */
 	switch (shsurf->zorder) {
-	case SHELL_SURFACE_ZORDER_BACKGROUND:
+		case SHELL_SURFACE_ZORDER_BACKGROUND:
 #ifdef IASDEBUG
-		/*
-		 * If the HMI is properly setting a background of its own, we no
-		 * longer have any need for the default background, so destroy
-		 * it.
-		 */
-		if (shell->default_background) {
-			weston_surface_destroy(shell->default_background);
-			shell->default_background = NULL;
-		}
+			/*
+			 * If the HMI is properly setting a background of its own, we no
+			 * longer have any need for the default background, so destroy
+			 * it.
+			 */
+			if (shell->default_background) {
+				weston_surface_destroy(shell->default_background);
+				shell->default_background = NULL;
+			}
 #endif
-		/* Background should always match output's position */
-		weston_view_set_position(shsurf->view,
-				shsurf->output->x, shsurf->output->y);
-		break;
-	case SHELL_SURFACE_ZORDER_POPUP:
-		/* Popups should be centered */
-		weston_view_set_position(shsurf->view,
-				shsurf->output->x + (shsurf->output->current_mode->width - width) / 2,
-				shsurf->output->y + (shsurf->output->current_mode->height - height) / 2);
-		break;
+			/* Background should always match output's position */
+			weston_view_set_position(shsurf->view,
+					shsurf->output->x, shsurf->output->y);
+			break;
+		case SHELL_SURFACE_ZORDER_POPUP:
+			/* Popups should be centered */
+			weston_view_set_position(shsurf->view,
+					shsurf->output->x + (shsurf->output->current_mode->width - width) / 2,
+					shsurf->output->y + (shsurf->output->current_mode->height - height) / 2);
+			break;
 
-	case SHELL_SURFACE_ZORDER_DEFAULT:
-	case SHELL_SURFACE_ZORDER_FULLSCREEN:
-	default:
-		/* Noop */
-		;
+		case SHELL_SURFACE_ZORDER_DEFAULT:
+		case SHELL_SURFACE_ZORDER_FULLSCREEN:
+		default:
+			/* Noop */
+			;
 	}
 
 	/* Add the surface to the appropriate layer surface list */
@@ -1749,11 +1765,16 @@ static void
 update_frame_count_and_attach(struct weston_surface *es, struct weston_buffer *buffer)
 {
 	struct ias_surface *shsurf = get_ias_surface(es);
+	struct frame_data *fd;
 
 	(*renderer_attach)(es, buffer);
 
 	if (shsurf) {
-		shsurf->frame_count++;
+		wl_list_for_each(fd, &shsurf->output_list, output_link) {
+			if (es->output_mask & (1u << fd->output_id)) {
+				fd->frame_count++;
+			}
+		}
 	}
 }
 
@@ -1794,32 +1815,53 @@ print_fps(struct wl_listener *listener, void *data)
 	float time_diff_secs;
 	uint32_t curr_time_ms;
 	struct ias_surface *shsurf;
+	struct ias_output *ias_output = data;
+	struct frame_data *fd;
 
 	gettimeofday(&curr_time, NULL);
 	curr_time_ms = (curr_time.tv_sec * 1000 + curr_time.tv_usec / 1000);
 
-	time_diff_secs = (curr_time_ms - prev_time_ms) / 1000;
-
-	wl_list_for_each(shsurf, &shell->client_surfaces, surface_link) {
-		shsurf->flip_count++;
-	}
+	time_diff_secs = (curr_time_ms - ias_output->prev_time_ms) / 1000;
 
 	if (time_diff_secs >= TARGET_NUM_SECONDS) {
 		fprintf(stdout, "--------------------------------------------------------\n");
 
-		wl_list_for_each(shsurf, &shell->client_surfaces, surface_link) {
-			fprintf(stdout, "%s: %d frames, %d flips in %6.3f seconds = %6.3f FPS\n",
-					shsurf->pname, shsurf->frame_count, shsurf->flip_count, time_diff_secs,
-					shsurf->frame_count / time_diff_secs);
-			fflush(stdout);
+		fprintf(stdout, "%s: output %d flips\n", ias_output->name,
+				ias_output->flip_count);
+	}
 
-			shsurf->frame_count = 0;
-			shsurf->flip_count = 0;
+	wl_list_for_each(shsurf, &shell->client_surfaces, surface_link) {
+		/* We only show those surfaces that are on this particular output */
+		if (!(shsurf->view->output_mask & (1 << ias_output->base.id)))
+			continue;
+
+		/*
+		 * Since a surface could be on multiple outputs, we now need to show
+		 * the frame count for a particular output only
+		 */
+		wl_list_for_each(fd, &shsurf->output_list, output_link) {
+			if (ias_output->base.id == fd->output_id) {
+				fd->flip_count++;
+
+				if (time_diff_secs >= TARGET_NUM_SECONDS) {
+
+					fprintf(stdout, "%s: %d frames, %d flips in %6.3f seconds = %6.3f FPS\n",
+							shsurf->pname, fd->frame_count, fd->flip_count, time_diff_secs,
+							fd->frame_count / time_diff_secs);
+					fflush(stdout);
+
+					fd->frame_count = 0;
+					fd->flip_count = 0;
+
+					ias_output->prev_time_ms = curr_time_ms;
+				}
+			}
 		}
+	}
 
+	if (time_diff_secs >= TARGET_NUM_SECONDS) {
 		fprintf(stdout, "--------------------------------------------------------\n");
-
-		prev_time_ms = curr_time_ms;
+		fflush(stdout);
 	}
 }
 
@@ -1881,6 +1923,11 @@ ias_committed(struct weston_surface *surface, int32_t relx, int32_t rely)
 	uint32_t old_hidden;
 	uint32_t new_hidden;
 	struct hmi_callback *cb;
+	struct weston_output *old_output;
+#ifdef BUILD_REMOTE_DISPLAY
+	struct ias_backend *ias_backend =
+			(struct ias_backend *)surface->compositor->backend;
+#endif
 
 	/* Shouldn't be possible to get here with non-IAS surfaces */
 	assert(shsurf);
@@ -1979,7 +2026,7 @@ ias_committed(struct weston_surface *surface, int32_t relx, int32_t rely)
 		if (!(shsurf->next_behavior & SHELL_SURFACE_BEHAVIOR_HIDDEN) &&
 				!(shsurf->next_behavior & IAS_HMI_INPUT_OWNER)) {
 			map(shell, surface, surface->width, surface->height,
-				sx, sy);
+					sx, sy);
 			surface->is_mapped = true;
 			shsurf->view->is_mapped = true;
 		}
@@ -2009,7 +2056,20 @@ ias_committed(struct weston_surface *surface, int32_t relx, int32_t rely)
 		scale_surface_if_fullscreen(shsurf);
 	}
 
+	old_output = surface->output;
 	weston_view_update_transform(shsurf->view);
+
+	/*
+	 * If the output for this surface has changed, then let's inform the backend
+	 */
+#ifdef BUILD_REMOTE_DISPLAY
+	if(old_output != surface->output) {
+		ias_backend->change_capture_output(ias_backend, surface);
+	}
+#else
+	/* To get rid of a set but not used warning */
+	old_output = old_output;
+#endif
 
 	/*
 	 * Notify listeners on ias_hmi interface that this surface has
@@ -2022,18 +2082,18 @@ ias_committed(struct weston_surface *surface, int32_t relx, int32_t rely)
 
 		wl_list_for_each(cb, &shell->sfc_change_callbacks, link) {
 			ias_hmi_send_surface_info(cb->resource, SURFPTR2ID(shsurf),
-				shsurf->title,
-				shsurf->zorder,
-				(int32_t)shsurf->view->geometry.x,
-				(int32_t)shsurf->view->geometry.y,
-				shsurf->surface->width,
-				shsurf->surface->height,
-				(uint32_t) (shsurf->view->alpha * 0xFF),
-				(uint32_t) (shsurf->behavior),
-				shsurf->pid,
-				shsurf->pname,
-				shsurf->view->output ? shsurf->view->output->id : 0,
-				ias_surface_is_flipped(shsurf));
+					shsurf->title,
+					shsurf->zorder,
+					(int32_t)shsurf->view->geometry.x,
+					(int32_t)shsurf->view->geometry.y,
+					shsurf->surface->width,
+					shsurf->surface->height,
+					(uint32_t) (shsurf->view->alpha * 0xFF),
+					(uint32_t) (shsurf->behavior),
+					shsurf->pid,
+					shsurf->pname,
+					shsurf->view->output ? shsurf->view->output->id : 0,
+					ias_surface_is_flipped(shsurf));
 		}
 	}
 }
@@ -2237,7 +2297,7 @@ set_transient(struct shell_surface *child,
 	 * child_surface->transient.x = x;
 	 * child_surface->transient.y = y;
 	 * child_surface->transient.flags = flags;
-	*/
+	 */
 
 	/*
 	 * If this surface is already transient to the parent, no further work
@@ -2321,6 +2381,101 @@ surface_resize(struct shell_surface *shsurf,
 		struct weston_pointer *pointer, uint32_t edges)
 {
 	return 0;
+}
+
+/*
+ * ias_shell_output_change_notify()
+ *
+ * When an output is scaled or moved, this gets called to allow the background
+ * surface (if any) to be re-configured to the new output size and position.
+ * Popup surfaces are also repositioned (but do not need to be resized).
+ */
+static void
+ias_shell_output_change_notify(struct wl_listener *listener, void *data)
+{
+	struct ias_output *ias_output = data;
+	struct ias_surface *shsurf;
+	unsigned int width, height;
+	struct bound_client *bound;
+	struct ias_shell *shell;
+	struct wl_resource *resource;
+
+	/* Walk list of background surfaces and resize/reposition them */
+	wl_list_for_each(shsurf, &self->background_surfaces, special_link) {
+		/* Make sure this surface is on the output that changed */
+		if (shsurf->output == (struct weston_output *)ias_output) {
+			if (ias_output->base.current_mode && ias_output->is_resized) {
+				/*
+				 * Send a reconfigure event to the client so that it's aware of
+				 * the new output size.
+				 */
+				send_configure(shsurf->surface,
+						shsurf->output->current_mode->width,
+						shsurf->output->current_mode->height);
+
+				shell = shsurf->shell;
+
+				wl_list_for_each(bound, &shell->ias_shell_clients, link) {
+					resource = wl_resource_find_for_client(
+							&ias_output->head.resource_list,
+							bound->client_id);
+
+					wl_output_send_geometry(resource,
+							shsurf->output->x,
+							shsurf->output->y,
+							ias_output->width,
+							ias_output->height,
+							ias_output->head.subpixel,
+							ias_output->head.make,
+							ias_output->head.model,
+							shsurf->output->transform);
+				}
+
+				/* Update internal weston state */
+				weston_view_set_position(shsurf->view, shsurf->output->x,
+						shsurf->output->y);
+
+				shsurf->view->surface->width = shsurf->output->current_mode->width;
+				shsurf->view->surface->height = shsurf->output->current_mode->height;
+
+				scale_surface_if_fullscreen(shsurf);
+			} else {
+				/*
+				 * Just a reposition; no need to notify client.  Just
+				 * reposition the background surface so that it stays bound
+				 * to the upper left corner of the output.
+				 */
+				weston_view_set_position(shsurf->view,
+						shsurf->output->x, shsurf->output->y);
+			}
+		}
+	}
+
+	/* Walk list of popup surfaces and make sure they stay centered */
+	wl_list_for_each(shsurf, &self->popup_surfaces, special_link) {
+		if (shsurf->output == (struct weston_output *)ias_output) {
+			/* Ignore hidden popups */
+			if (shsurf->behavior & SHELL_SURFACE_BEHAVIOR_HIDDEN) {
+				continue;
+			}
+
+			/* Get current surface geometry */
+			width = shsurf->surface->width;
+			height = shsurf->surface->height;
+
+			/* Center the popup in the middle of the output */
+			weston_view_set_position(shsurf->view,
+					shsurf->output->x + (shsurf->output->current_mode->width - width) / 2,
+					shsurf->output->y + (shsurf->output->current_mode->height - height) / 2);
+
+		}
+	}
+
+	/* Make sure whole output gets repainted */
+	weston_output_damage(&ias_output->base);
+
+	/* Done processing updates.  Mark output as not resized. */
+	ias_output->is_resized = 0;
 }
 
 /***
@@ -2468,9 +2623,6 @@ WL_EXPORT int wet_shell_init(struct weston_compositor *compositor,
 	/* Load configuration file */
 	ias_shell_configuration(shell);
 
-	gettimeofday(&curr_time, NULL);
-	prev_time_ms = (curr_time.tv_sec * 1000 + curr_time.tv_usec / 1000);
-
 	/*
 	 * Create global objects for ias_shell, ias_hmi, and layout manager.
 	 * Note that the layout manager will only be advertised if we're actually
@@ -2520,95 +2672,3 @@ WL_EXPORT int wet_shell_init(struct weston_compositor *compositor,
 }
 
 
-/*
- * ias_shell_output_change_notify()
- *
- * When an output is scaled or moved, this gets called to allow the background
- * surface (if any) to be re-configured to the new output size and position.
- * Popup surfaces are also repositioned (but do not need to be resized).
- */
-static void
-ias_shell_output_change_notify(struct wl_listener *listener, void *data)
-{
-	struct ias_output *ias_output = data;
-	struct ias_surface *shsurf;
-	unsigned int width, height;
-	struct bound_client *bound;
-	struct ias_shell *shell;
-	struct wl_resource *resource;
-
-	/* Walk list of background surfaces and resize/reposition them */
-	wl_list_for_each(shsurf, &self->background_surfaces, special_link) {
-		/* Make sure this surface is on the output that changed */
-		if (shsurf->output == (struct weston_output *)ias_output) {
-			if (ias_output->base.current_mode && ias_output->is_resized) {
-				/*
-				 * Send a reconfigure event to the client so that it's aware of
-				 * the new output size.
-				 */
-				send_configure(shsurf->surface,
-						shsurf->output->current_mode->width,
-						shsurf->output->current_mode->height);
-
-				shell = shsurf->shell;
-
-				wl_list_for_each(bound, &shell->ias_shell_clients, link) {
-					resource = wl_resource_find_for_client(&shsurf->output->resource_list,
-											bound->client_id);
-
-					wl_output_send_geometry(resource,
-						shsurf->output->x,
-						shsurf->output->y,
-						ias_output->width,
-						ias_output->height,
-						shsurf->output->subpixel,
-						shsurf->output->make, shsurf->output->model,
-						shsurf->output->transform);
-				}
-
-				/* Update internal weston state */
-				weston_view_set_position(shsurf->view, shsurf->output->x,
-						shsurf->output->y);
-
-				shsurf->view->surface->width = shsurf->output->current_mode->width;
-				shsurf->view->surface->height = shsurf->output->current_mode->height;
-
-				scale_surface_if_fullscreen(shsurf);
-			} else {
-				/*
-				 * Just a reposition; no need to notify client.  Just
-				 * reposition the background surface so that it stays bound
-				 * to the upper left corner of the output.
-				 */
-				weston_view_set_position(shsurf->view,
-						shsurf->output->x, shsurf->output->y);
-			}
-		}
-	}
-
-	/* Walk list of popup surfaces and make sure they stay centered */
-	wl_list_for_each(shsurf, &self->popup_surfaces, special_link) {
-		if (shsurf->output == (struct weston_output *)ias_output) {
-			/* Ignore hidden popups */
-			if (shsurf->behavior & SHELL_SURFACE_BEHAVIOR_HIDDEN) {
-				continue;
-			}
-
-			/* Get current surface geometry */
-			width = shsurf->surface->width;
-			height = shsurf->surface->height;
-
-			/* Center the popup in the middle of the output */
-			weston_view_set_position(shsurf->view,
-					shsurf->output->x + (shsurf->output->current_mode->width - width) / 2,
-					shsurf->output->y + (shsurf->output->current_mode->height - height) / 2);
-
-		}
-	}
-
-	/* Make sure whole output gets repainted */
-	weston_output_damage(&ias_output->base);
-
-	/* Done processing updates.  Mark output as not resized. */
-	ias_output->is_resized = 0;
-}

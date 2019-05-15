@@ -41,6 +41,7 @@ struct pixman_output_state {
 	void *shadow_buffer;
 	pixman_image_t *shadow_image;
 	pixman_image_t *hw_buffer;
+	pixman_region32_t *hw_extra_damage;
 };
 
 struct pixman_surface_state {
@@ -48,6 +49,7 @@ struct pixman_surface_state {
 
 	pixman_image_t *image;
 	struct weston_buffer_reference buffer_ref;
+	struct weston_buffer_release_reference buffer_release_ref;
 
 	struct wl_listener buffer_destroy_listener;
 	struct wl_listener surface_destroy_listener;
@@ -336,13 +338,19 @@ repaint_region(struct weston_view *ev, struct weston_output *output,
 	struct pixman_surface_state *ps = get_surface_state(ev->surface);
 	struct pixman_output_state *po = get_output_state(output);
 	struct weston_buffer_viewport *vp = &ev->surface->buffer_viewport;
+	pixman_image_t *target_image;
 	pixman_transform_t transform;
 	pixman_filter_t filter;
 	pixman_image_t *mask_image;
 	pixman_color_t mask = { 0, };
 
+	if (po->shadow_image)
+		target_image = po->shadow_image;
+	else
+		target_image = po->hw_buffer;
+
 	/* Clip rendering to the damaged output region */
-	pixman_image_set_clip_region32(po->shadow_image, repaint_output);
+	pixman_image_set_clip_region32(target_image, repaint_output);
 
 	pixman_renderer_compute_transform(&transform, ev, output);
 
@@ -362,11 +370,11 @@ repaint_region(struct weston_view *ev, struct weston_output *output,
 	}
 
 	if (source_clip)
-		composite_clipped(ps->image, mask_image, po->shadow_image,
+		composite_clipped(ps->image, mask_image, target_image,
 				  &transform, filter, source_clip);
 	else
 		composite_whole(pixman_op, ps->image, mask_image,
-				po->shadow_image, &transform, filter);
+				target_image, &transform, filter);
 
 	if (mask_image)
 		pixman_image_unref(mask_image);
@@ -378,14 +386,14 @@ repaint_region(struct weston_view *ev, struct weston_output *output,
 		pixman_image_composite32(PIXMAN_OP_OVER,
 					 pr->debug_color, /* src */
 					 NULL /* mask */,
-					 po->shadow_image, /* dest */
+					 target_image, /* dest */
 					 0, 0, /* src_x, src_y */
 					 0, 0, /* mask_x, mask_y */
 					 0, 0, /* dest_x, dest_y */
-					 pixman_image_get_width (po->shadow_image), /* width */
-					 pixman_image_get_height (po->shadow_image) /* height */);
+					 pixman_image_get_width (target_image), /* width */
+					 pixman_image_get_height (target_image) /* height */);
 
-	pixman_image_set_clip_region32 (po->shadow_image, NULL);
+	pixman_image_set_clip_region32(target_image, NULL);
 }
 
 static void
@@ -555,15 +563,32 @@ copy_to_hw_buffer(struct weston_output *output, pixman_region32_t *region)
 
 static void
 pixman_renderer_repaint_output(struct weston_output *output,
-			     pixman_region32_t *output_damage)
+			       pixman_region32_t *output_damage)
 {
 	struct pixman_output_state *po = get_output_state(output);
+	pixman_region32_t hw_damage;
 
-	if (!po->hw_buffer)
+	if (!po->hw_buffer) {
+		po->hw_extra_damage = NULL;
 		return;
+	}
 
-	repaint_surfaces(output, output_damage);
-	copy_to_hw_buffer(output, output_damage);
+	pixman_region32_init(&hw_damage);
+	if (po->hw_extra_damage) {
+		pixman_region32_union(&hw_damage,
+				      po->hw_extra_damage, output_damage);
+		po->hw_extra_damage = NULL;
+	} else {
+		pixman_region32_copy(&hw_damage, output_damage);
+	}
+
+	if (po->shadow_image) {
+		repaint_surfaces(output, output_damage);
+		copy_to_hw_buffer(output, &hw_damage);
+	} else {
+		repaint_surfaces(output, &hw_damage);
+	}
+	pixman_region32_fini(&hw_damage);
 
 	pixman_region32_copy(&output->previous_damage, output_damage);
 	wl_signal_emit(&output->frame_signal, output);
@@ -601,6 +626,8 @@ pixman_renderer_attach(struct weston_surface *es, struct weston_buffer *buffer)
 	pixman_format_code_t pixman_format;
 
 	weston_buffer_reference(&ps->buffer_ref, buffer);
+	weston_buffer_release_reference(&ps->buffer_release_ref,
+					es->buffer_release_ref.buffer_release);
 
 	if (ps->buffer_destroy_listener.notify) {
 		wl_list_remove(&ps->buffer_destroy_listener.link);
@@ -620,22 +647,30 @@ pixman_renderer_attach(struct weston_surface *es, struct weston_buffer *buffer)
 	if (! shm_buffer) {
 		weston_log("Pixman renderer supports only SHM buffers\n");
 		weston_buffer_reference(&ps->buffer_ref, NULL);
+		weston_buffer_release_reference(&ps->buffer_release_ref, NULL);
 		return;
 	}
 
 	switch (wl_shm_buffer_get_format(shm_buffer)) {
 	case WL_SHM_FORMAT_XRGB8888:
 		pixman_format = PIXMAN_x8r8g8b8;
+		es->is_opaque = true;
 		break;
 	case WL_SHM_FORMAT_ARGB8888:
 		pixman_format = PIXMAN_a8r8g8b8;
+		es->is_opaque = false;
 		break;
 	case WL_SHM_FORMAT_RGB565:
 		pixman_format = PIXMAN_r5g6b5;
+		es->is_opaque = true;
 		break;
 	default:
-		weston_log("Unsupported SHM buffer format\n");
+		weston_log("Unsupported SHM buffer format 0x%x\n",
+			wl_shm_buffer_get_format(shm_buffer));
 		weston_buffer_reference(&ps->buffer_ref, NULL);
+		weston_buffer_release_reference(&ps->buffer_release_ref, NULL);
+                weston_buffer_send_server_error(buffer,
+			"disconnecting due to unhandled buffer type");
 		return;
 	break;
 	}
@@ -672,6 +707,7 @@ pixman_renderer_surface_state_destroy(struct pixman_surface_state *ps)
 		ps->image = NULL;
 	}
 	weston_buffer_reference(&ps->buffer_ref, NULL);
+	weston_buffer_release_reference(&ps->buffer_release_ref, NULL);
 	free(ps);
 }
 
@@ -862,7 +898,8 @@ pixman_renderer_init(struct weston_compositor *ec)
 }
 
 WL_EXPORT void
-pixman_renderer_output_set_buffer(struct weston_output *output, pixman_image_t *buffer)
+pixman_renderer_output_set_buffer(struct weston_output *output,
+				  pixman_image_t *buffer)
 {
 	struct pixman_output_state *po = get_output_state(output);
 
@@ -876,8 +913,17 @@ pixman_renderer_output_set_buffer(struct weston_output *output, pixman_image_t *
 	}
 }
 
+WL_EXPORT void
+pixman_renderer_output_set_hw_extra_damage(struct weston_output *output,
+					   pixman_region32_t *extra_damage)
+{
+	struct pixman_output_state *po = get_output_state(output);
+
+	po->hw_extra_damage = extra_damage;
+}
+
 WL_EXPORT int
-pixman_renderer_output_create(struct weston_output *output)
+pixman_renderer_output_create(struct weston_output *output, uint32_t flags)
 {
 	struct pixman_output_state *po;
 	int w, h;
@@ -886,25 +932,27 @@ pixman_renderer_output_create(struct weston_output *output)
 	if (po == NULL)
 		return -1;
 
-	/* set shadow image transformation */
-	w = output->current_mode->width;
-	h = output->current_mode->height;
+	if (flags & PIXMAN_RENDERER_OUTPUT_USE_SHADOW) {
+		/* set shadow image transformation */
+		w = output->current_mode->width;
+		h = output->current_mode->height;
 
-	po->shadow_buffer = malloc(w * h * 4);
+		po->shadow_buffer = malloc(w * h * 4);
 
-	if (!po->shadow_buffer) {
-		free(po);
-		return -1;
-	}
+		if (!po->shadow_buffer) {
+			free(po);
+			return -1;
+		}
 
-	po->shadow_image =
-		pixman_image_create_bits(PIXMAN_x8r8g8b8, w, h,
-					 po->shadow_buffer, w * 4);
+		po->shadow_image =
+			pixman_image_create_bits(PIXMAN_x8r8g8b8, w, h,
+						 po->shadow_buffer, w * 4);
 
-	if (!po->shadow_image) {
-		free(po->shadow_buffer);
-		free(po);
-		return -1;
+		if (!po->shadow_image) {
+			free(po->shadow_buffer);
+			free(po);
+			return -1;
+		}
 	}
 
 	output->renderer_state = po;
@@ -917,7 +965,8 @@ pixman_renderer_output_destroy(struct weston_output *output)
 {
 	struct pixman_output_state *po = get_output_state(output);
 
-	pixman_image_unref(po->shadow_image);
+	if (po->shadow_image)
+		pixman_image_unref(po->shadow_image);
 
 	if (po->hw_buffer)
 		pixman_image_unref(po->hw_buffer);

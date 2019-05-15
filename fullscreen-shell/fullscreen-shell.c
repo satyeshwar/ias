@@ -546,7 +546,7 @@ fs_output_configure_for_mode(struct fs_output *fsout,
 					&surf_width, &surf_height);
 
 	/* The actual output mode is in physical units.  We need to
-	 * transform the surface size to physical unit size by flipping ans
+	 * transform the surface size to physical unit size by flipping and
 	 * possibly scaling it.
 	 */
 	switch (fsout->output->transform) {
@@ -769,7 +769,7 @@ fullscreen_shell_present_surface(struct wl_client *client,
 	}
 
 	if (output_res) {
-		output = weston_output_from_resource(output_res);
+		output = weston_head_from_resource(output_res)->output;
 		fsout = fs_output_for_output(output);
 		fs_output_set_surface(fsout, surface, method, 0, 0);
 	} else {
@@ -813,7 +813,7 @@ fullscreen_shell_present_surface_for_mode(struct wl_client *client,
 	struct weston_seat *seat;
 	struct fs_output *fsout;
 
-	output = weston_output_from_resource(output_res);
+	output = weston_head_from_resource(output_res)->output;
 	fsout = fs_output_for_output(output);
 
 	if (surface_res == NULL) {

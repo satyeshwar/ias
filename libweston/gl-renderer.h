@@ -124,6 +124,13 @@ struct gl_renderer_interface {
 				  int32_t width, int32_t height,
 				  int32_t tex_width, unsigned char *data);
 
+	/* Create fence sync FD to wait for GPU rendering.
+	 *
+	 * Return FD on success, -1 on failure or unsupported
+	 * EGL_ANDROID_native_fence_sync extension.
+	 */
+	int (*create_fence_fd)(struct weston_output *output);
+
 	void (*print_egl_error_state)(void);
 
 	/***
@@ -143,14 +150,15 @@ struct gl_renderer_interface {
 
 	int rbc;
 
-#ifdef USE_VM
+#ifdef HYPER_DMABUF
 	int vm_exec;
 	int vm_dbg;
 	int vm_unexport_delay;
 	int vm_share_only;
+	int vm_use_plugin;
 	const char* vm_plugin_path;
 	const char* vm_plugin_args;
-#endif // USE_VM
+#endif /* HYPER_DMABUF */
 };
 
 struct gl_shader {
@@ -238,9 +246,13 @@ struct gl_renderer {
 	PFNEGLDESTROYSYNCKHRPROC destroy_sync;
 	PFNEGLDUPNATIVEFENCEFDANDROIDPROC dup_native_fence_fd;
 
-#ifdef USE_VM
+
+	int has_wait_sync;
+	PFNEGLWAITSYNCKHRPROC wait_sync;
+
+#ifdef HYPER_DMABUF
 	void *vm_buffer_table;
-#endif // USE_VM
+#endif /* HYPER_DMABUF */
 };
 
 enum timeline_render_point_type {
@@ -284,6 +296,7 @@ struct gl_surface_state {
 	int num_images;
 
 	struct weston_buffer_reference buffer_ref;
+	struct weston_buffer_release_reference buffer_release_ref;
 	enum buffer_type buffer_type;
 	int pitch; /* in pixels */
 	int height; /* in pixels */
@@ -295,6 +308,10 @@ struct gl_surface_state {
 	int vsub[3];  /* vertical subsampling per plane */
 
 	struct weston_surface *surface;
+
+	/* Whether this surface was used in the current output repaint.
+	   Used only in the context of a gl_renderer_repaint_output call. */
+	bool used_in_output_repaint;
 
 	struct wl_listener surface_destroy_listener;
 	struct wl_listener renderer_destroy_listener;
@@ -330,6 +347,8 @@ struct gl_output_state {
 	enum gl_border_status border_status;
 
 	struct weston_matrix output_matrix;
+
+	EGLSyncKHR begin_render_sync, end_render_sync;
 
 	/* struct timeline_render_point::link */
 	struct wl_list timeline_render_point_list;

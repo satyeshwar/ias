@@ -36,20 +36,18 @@
 #include "compositor/weston.h"
 #include "weston-test-server-protocol.h"
 
-#ifdef ENABLE_EGL
-#include <EGL/egl.h>
-#include <EGL/eglext.h>
-#include "weston-egl-ext.h"
-#endif /* ENABLE_EGL */
-
 #include "shared/helpers.h"
 #include "shared/timespec-util.h"
+
+#define MAX_TOUCH_DEVICES 32
 
 struct weston_test {
 	struct weston_compositor *compositor;
 	struct weston_layer layer;
 	struct weston_process process;
 	struct weston_seat seat;
+	struct weston_touch_device *touch_device[MAX_TOUCH_DEVICES];
+	int nr_touch_devices;
 	bool is_seat_initialized;
 };
 
@@ -74,12 +72,43 @@ test_client_sigchld(struct weston_process *process, int status)
 	/* In case the child aborted or segfaulted... */
 	assert(status == 0);
 
-	wl_display_terminate(test->compositor->wl_display);
+	weston_compositor_exit(test->compositor);
+}
+
+static void
+touch_device_add(struct weston_test *test)
+{
+	char buf[128];
+	int i = test->nr_touch_devices;
+
+	assert(i < MAX_TOUCH_DEVICES);
+	assert(!test->touch_device[i]);
+
+	snprintf(buf, sizeof buf, "test-touch-device-%d", i);
+
+	test->touch_device[i] = weston_touch_create_touch_device(
+				test->seat.touch_state, buf, NULL, NULL);
+	test->nr_touch_devices++;
+}
+
+static void
+touch_device_remove(struct weston_test *test)
+{
+	int i = test->nr_touch_devices - 1;
+
+	assert(i >= 0);
+	assert(test->touch_device[i]);
+	weston_touch_device_destroy(test->touch_device[i]);
+	test->touch_device[i] = NULL;
+	--test->nr_touch_devices;
 }
 
 static int
 test_seat_init(struct weston_test *test)
 {
+	assert(!test->is_seat_initialized &&
+	       "Trying to add already added test seat");
+
 	/* create our own seat */
 	weston_seat_init(&test->seat, test->compositor, "test-seat");
 	test->is_seat_initialized = true;
@@ -89,8 +118,22 @@ test_seat_init(struct weston_test *test)
 	if (weston_seat_init_keyboard(&test->seat, NULL) < 0)
 		return -1;
 	weston_seat_init_touch(&test->seat);
+	touch_device_add(test);
 
 	return 0;
+}
+
+static void
+test_seat_release(struct weston_test *test)
+{
+	while (test->nr_touch_devices > 0)
+		touch_device_remove(test);
+
+	assert(test->is_seat_initialized &&
+	       "Trying to release already released test seat");
+	test->is_seat_initialized = false;
+	weston_seat_release(&test->seat);
+	memset(&test->seat, 0, sizeof test->seat);
 }
 
 static struct weston_seat *
@@ -268,12 +311,10 @@ device_release(struct wl_client *client,
 	} else if (strcmp(device, "keyboard") == 0) {
 		weston_seat_release_keyboard(seat);
 	} else if (strcmp(device, "touch") == 0) {
+		touch_device_remove(test);
 		weston_seat_release_touch(seat);
 	} else if (strcmp(device, "seat") == 0) {
-		assert(test->is_seat_initialized &&
-		       "Trying to release already released test seat");
-		weston_seat_release(seat);
-		test->is_seat_initialized = false;
+		test_seat_release(test);
 	} else {
 		assert(0 && "Unsupported device");
 	}
@@ -292,9 +333,8 @@ device_add(struct wl_client *client,
 		weston_seat_init_keyboard(seat, NULL);
 	} else if (strcmp(device, "touch") == 0) {
 		weston_seat_init_touch(seat);
+		touch_device_add(test);
 	} else if (strcmp(device, "seat") == 0) {
-		assert(!test->is_seat_initialized &&
-		       "Trying to add already added test seat");
 		test_seat_init(test);
 	} else {
 		assert(0 && "Unsupported device");
@@ -530,7 +570,7 @@ capture_screenshot(struct wl_client *client,
 		   struct wl_resource *buffer_resource)
 {
 	struct weston_output *output =
-		weston_output_from_resource(output_resource);
+		weston_head_from_resource(output_resource)->output;
 	struct weston_buffer *buffer =
 		weston_buffer_from_resource(buffer_resource);
 
@@ -549,12 +589,14 @@ send_touch(struct wl_client *client, struct wl_resource *resource,
 	   int32_t touch_id, wl_fixed_t x, wl_fixed_t y, uint32_t touch_type)
 {
 	struct weston_test *test = wl_resource_get_user_data(resource);
-	struct weston_seat *seat = get_seat(test);
+	struct weston_touch_device *device = test->touch_device[0];
 	struct timespec time;
+
+	assert(device);
 
 	timespec_from_proto(&time, tv_sec_hi, tv_sec_lo, tv_nsec);
 
-	notify_touch(seat, &time, touch_id, wl_fixed_to_double(x),
+	notify_touch(device, &time, touch_id, wl_fixed_to_double(x),
 		     wl_fixed_to_double(y), touch_type);
 }
 

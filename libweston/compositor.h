@@ -1,6 +1,7 @@
 /*
  * Copyright © 2008-2011 Kristian Høgsberg
- * Copyright © 2012 Collabora, Ltd.
+ * Copyright © 2012, 2017, 2018 Collabora, Ltd.
+ * Copyright © 2017, 2018 General Electric Company
  *
  * Permission is hereby granted, free of charge, to any person obtaining
  * a copy of this software and associated documentation files (the
@@ -83,6 +84,12 @@ struct weston_transform {
 	struct wl_list link;
 };
 
+/** 2D device coordinates normalized to [0, 1] range */
+struct weston_point2d_device_normalized {
+	double x;
+	double y;
+};
+
 struct weston_surface;
 struct weston_buffer;
 struct shell_surface;
@@ -112,8 +119,23 @@ enum weston_led {
 	LED_SCROLL_LOCK = (1 << 2),
 };
 
+enum weston_mode_aspect_ratio {
+	/** The picture aspect ratio values, for the aspect_ratio field of
+	 *  weston_mode. The values here, are taken from
+	 *  DRM_MODE_PICTURE_ASPECT_* from drm_mode.h.
+	 */
+	WESTON_MODE_PIC_AR_NONE = 0,	/* DRM_MODE_PICTURE_ASPECT_NONE */
+	WESTON_MODE_PIC_AR_4_3 = 1,	/* DRM_MODE_PICTURE_ASPECT_4_3 */
+	WESTON_MODE_PIC_AR_16_9 = 2,	/* DRM_MODE_PICTURE_ASPECT_16_9 */
+	WESTON_MODE_PIC_AR_64_27 = 3,	/* DRM_MODE_PICTURE_ASPECT_64_27 */
+	WESTON_MODE_PIC_AR_256_135 = 4,	/* DRM_MODE_PICTURE_ASPECT_256_135*/
+};
+
+
+
 struct weston_mode {
 	uint32_t flags;
+	enum weston_mode_aspect_ratio aspect_ratio;
 	int32_t width, height;
 	uint32_t refresh;
 	struct wl_list link;
@@ -204,15 +226,46 @@ enum dpms_enum {
 
 struct ias_plugin;
 
+/** Represents a monitor
+ *
+ * This object represents a monitor (hardware backends like DRM) or a window
+ * (windowed nested backends).
+ */
+struct weston_head {
+	struct weston_compositor *compositor;	/**< owning compositor */
+	struct wl_list compositor_link;	/**< in weston_compositor::head_list */
+	struct wl_signal destroy_signal;	/**< destroy callbacks */
+
+	struct weston_output *output;	/**< the output driving this head */
+	struct wl_list output_link;	/**< in weston_output::head_list */
+
+	struct wl_list resource_list;	/**< wl_output protocol objects */
+	struct wl_global *global;	/**< wl_output global */
+
+	int32_t mm_width;		/**< physical image width in mm */
+	int32_t mm_height;		/**< physical image height in mm */
+	char *make;			/**< monitor manufacturer (PNP ID) */
+	char *model;			/**< monitor model */
+	char *serial_number;		/**< monitor serial */
+	uint32_t subpixel;		/**< enum wl_output_subpixel */
+	bool connection_internal;	/**< embedded monitor (e.g. laptop) */
+	bool device_changed;		/**< monitor information has changed */
+
+	char *name;			/**< head name, e.g. connector name */
+	bool connected;			/**< is physically connected */
+	bool non_desktop;		/**< non-desktop display, e.g. HMD */
+};
+
 struct weston_output {
 	uint32_t id;
 	char *name;
 
+	/** Matches the lifetime from the user perspective */
+	struct wl_signal user_destroy_signal;
+
 	void *renderer_state;
 
 	struct wl_list link;
-	struct wl_list resource_list;
-	struct wl_global *global;
 	struct weston_compositor *compositor;
 
 	/** From global to output buffer coordinates. */
@@ -222,7 +275,6 @@ struct weston_output {
 
 	struct wl_list animation_list;
 	int32_t x, y, width, height;
-	int32_t mm_width, mm_height;
 
 	/** Output area in global coordinates, simple rect */
 	pixman_region32_t region;
@@ -232,6 +284,9 @@ struct weston_output {
 	/** True if damage has occurred since the last repaint for this output;
 	 *  if set, a repaint will eventually occur. */
 	bool repaint_needed;
+
+	/** Used only between repaint_begin and repaint_cancel. */
+	bool repainted;
 
 	/** State of the repaint loop */
 	enum {
@@ -245,10 +300,13 @@ struct weston_output {
 	 *  next repaint should be run */
 	struct timespec next_repaint;
 
+	/** For cancelling the idle_repaint callback on output destruction. */
+	struct wl_event_source *idle_repaint_source;
+
 	struct weston_output_zoom zoom;
 	int dirty;
 	struct wl_signal frame_signal;
-	struct wl_signal destroy_signal;
+	struct wl_signal destroy_signal;	/**< sent when disabled */
 	int move_x, move_y;
 	struct timespec frame_time; /* presentation timestamp */
 	uint64_t msc;        /* media stream counter */
@@ -256,8 +314,6 @@ struct weston_output {
 	int destroying;
 	struct wl_list feedback_list;
 
-	char *make, *model, *serial_number;
-	uint32_t subpixel;
 	uint32_t transform;
 	int32_t native_scale;
 	int32_t current_scale;
@@ -267,6 +323,8 @@ struct weston_output {
 	struct weston_mode *current_mode;
 	struct weston_mode *original_mode;
 	struct wl_list mode_list;
+
+	struct wl_list head_list; /**< List of driven weston_heads */
 
 	void (*start_repaint_loop)(struct weston_output *output);
 	int (*repaint)(struct weston_output *output,
@@ -281,7 +339,6 @@ struct weston_output {
 	void (*set_backlight)(struct weston_output *output, uint32_t value);
 	void (*set_dpms)(struct weston_output *output, enum dpms_enum level);
 
-	bool connection_internal;
 	uint16_t gamma_size;
 	void (*set_gamma)(struct weston_output *output,
 			  uint16_t size,
@@ -296,6 +353,33 @@ struct weston_output {
 
 	int (*enable)(struct weston_output *output);
 	int (*disable)(struct weston_output *output);
+
+	/** Attach a head in the backend
+	 *
+	 * @param output The output to attach to.
+	 * @param head The head to attach.
+	 * @return 0 on success, -1 on failure.
+	 *
+	 * Do anything necessary to account for a new head being attached to
+	 * the output, and check any conditions possible. On failure, both
+	 * the head and the output must be left as before the call.
+	 *
+	 * Libweston core will add the head to the head_list after a successful
+	 * call.
+	 */
+	int (*attach_head)(struct weston_output *output,
+			   struct weston_head *head);
+
+	/** Detach a head in the backend
+	 *
+	 * @param output The output to detach from.
+	 * @param head The head to detach.
+	 *
+	 * Do any clean-up necessary to detach this head from the output.
+	 * The head has already been removed from the output's head_list.
+	 */
+	void (*detach_head)(struct weston_output *output,
+			    struct weston_head *head);
 
 	/***
 	 *** IAS-specific additions
@@ -469,9 +553,82 @@ struct weston_pointer {
 	struct wl_list timestamps_list;
 };
 
+/** libinput style calibration matrix
+ *
+ * See https://wayland.freedesktop.org/libinput/doc/latest/absolute_axes.html
+ * and libinput_device_config_calibration_set_matrix().
+ */
+struct weston_touch_device_matrix {
+	float m[6];
+};
 
+struct weston_touch_device;
+
+/** Operations for a calibratable touchscreen */
+struct weston_touch_device_ops {
+	/** Get the associated output if existing. */
+	struct weston_output *(*get_output)(struct weston_touch_device *device);
+
+	/** Get the name of the associated head if existing. */
+	const char *
+	(*get_calibration_head_name)(struct weston_touch_device *device);
+
+	/** Retrieve the current calibration matrix. */
+	void (*get_calibration)(struct weston_touch_device *device,
+				struct weston_touch_device_matrix *cal);
+
+	/** Set a new calibration matrix. */
+	void (*set_calibration)(struct weston_touch_device *device,
+				const struct weston_touch_device_matrix *cal);
+};
+
+enum weston_touch_mode {
+	/** Normal touch event handling */
+	WESTON_TOUCH_MODE_NORMAL,
+
+	/** Prepare moving to WESTON_TOUCH_MODE_CALIB.
+	 *
+	 * Move to WESTON_TOUCH_MODE_CALIB as soon as no touches are down on
+	 * any seat. Until then, all touch events are routed normally.
+	 */
+	WESTON_TOUCH_MODE_PREP_CALIB,
+
+	/** Calibration mode
+	 *
+	 * Only a single weston_touch_device forwards events to the calibrator
+	 * all other touch device cause a calibrator "wrong device" event to
+	 * be sent.
+	 */
+	WESTON_TOUCH_MODE_CALIB,
+
+	/** Prepare moving to WESTON_TOUCH_MODE_NORMAL.
+	 *
+	 * Move to WESTON_TOUCH_MODE_NORMAL as soon as no touches are down on
+	 * any seat. Until then, touch events are routed as in
+	 * WESTON_TOUCH_MODE_CALIB except "wrong device" events are not sent.
+	 */
+	WESTON_TOUCH_MODE_PREP_NORMAL
+};
+
+/** Represents a physical touchscreen input device */
+struct weston_touch_device {
+	char *syspath;			/**< unique name */
+
+	struct weston_touch *aggregate;	/**< weston_touch this is part of */
+	struct wl_list link;		/**< in weston_touch::device_list */
+	struct wl_signal destroy_signal;	/**< destroy notifier */
+
+	void *backend_data;		/**< backend-specific private */
+
+	const struct weston_touch_device_ops *ops;
+	struct weston_touch_device_matrix saved_calibration;
+};
+
+/** Represents a set of touchscreen devices aggregated under a seat */
 struct weston_touch {
 	struct weston_seat *seat;
+
+	struct wl_list device_list;	/* struct weston_touch_device::link */
 
 	struct wl_list resource_list;
 	struct wl_list focus_resource_list;
@@ -498,10 +655,6 @@ weston_pointer_motion_to_abs(struct weston_pointer *pointer,
 			     struct weston_pointer_motion_event *event,
 			     wl_fixed_t *x, wl_fixed_t *y);
 
-struct weston_pointer *
-weston_pointer_create(struct weston_seat *seat);
-void
-weston_pointer_destroy(struct weston_pointer *pointer);
 void
 weston_pointer_send_motion(struct weston_pointer *pointer,
 			   const struct timespec *time,
@@ -546,10 +699,6 @@ weston_pointer_set_default_grab(struct weston_pointer *pointer,
 void
 weston_pointer_constraint_destroy(struct weston_pointer_constraint *constraint);
 
-struct weston_keyboard *
-weston_keyboard_create(void);
-void
-weston_keyboard_destroy(struct weston_keyboard *keyboard);
 void
 weston_keyboard_set_focus(struct weston_keyboard *keyboard,
 			  struct weston_surface *surface);
@@ -578,15 +727,11 @@ weston_keyboard_send_modifiers(struct weston_keyboard *keyboard,
 			       uint32_t mods_latched,
 			       uint32_t mods_locked, uint32_t group);
 
-struct weston_touch *
-weston_touch_create(void);
-void
-weston_touch_destroy(struct weston_touch *touch);
 void
 weston_touch_set_focus(struct weston_touch *touch,
 		       struct weston_view *view);
 void
-weston_touch_start_grab(struct weston_touch *device,
+weston_touch_start_grab(struct weston_touch *touch,
 			struct weston_touch_grab *grab);
 void
 weston_touch_end_grab(struct weston_touch *touch);
@@ -605,6 +750,18 @@ weston_touch_send_motion(struct weston_touch *touch,
 			 wl_fixed_t x, wl_fixed_t y);
 void
 weston_touch_send_frame(struct weston_touch *touch);
+
+struct weston_touch_device *
+weston_touch_create_touch_device(struct weston_touch *touch,
+				 const char *syspath,
+				 void *backend_data,
+				 const struct weston_touch_device_ops *ops);
+
+void
+weston_touch_device_destroy(struct weston_touch_device *device);
+
+bool
+weston_touch_device_can_calibrate(struct weston_touch_device *device);
 
 void
 wl_data_device_set_keyboard_focus(struct weston_seat *seat);
@@ -632,9 +789,8 @@ weston_touch_start_drag(struct weston_touch *touch,
 
 struct weston_xkb_info {
 	struct xkb_keymap *keymap;
-	int keymap_fd;
 	size_t keymap_size;
-	char *keymap_area;
+	char *keymap_string;
 	int32_t ref_count;
 	xkb_mod_index_t shift_mod;
 	xkb_mod_index_t caps_mod;
@@ -908,6 +1064,9 @@ enum weston_capability {
 
 	/* renderer supports weston_view_set_mask() clipping */
 	WESTON_CAP_VIEW_CLIP_MASK		= 0x0010,
+
+	/* renderer supports explicit synchronization */
+	WESTON_CAP_EXPLICIT_SYNC		= 0x0020,
 };
 
 /* Configuration struct for a backend.
@@ -981,10 +1140,41 @@ struct weston_backend {
 	 */
 	void (*repaint_flush)(struct weston_compositor *compositor,
 			      void *repaint_data);
+
+	/** Allocate a new output
+	 *
+	 * @param compositor The compositor.
+	 * @param name Name for the new output.
+	 *
+	 * Allocates a new output structure that embeds a weston_output,
+	 * initializes it, and returns the pointer to the weston_output
+	 * member.
+	 *
+	 * Must set weston_output members @c destroy, @c enable and @c disable.
+	 */
+	struct weston_output *
+	(*create_output)(struct weston_compositor *compositor,
+			 const char *name);
 };
+
+/** Callback for saving calibration
+ *
+ * \param compositor The compositor.
+ * \param device The physical touch device to save for.
+ * \param calibration The new calibration from a client.
+ * \return -1 on failure, 0 on success.
+ *
+ * Failure will prevent taking the new calibration into use.
+ */
+typedef int (*weston_touch_calibration_save_func)(
+	struct weston_compositor *compositor,
+	struct weston_touch_device *device,
+	const struct weston_touch_device_matrix *calibration);
+struct weston_touch_calibrator;
 
 struct weston_desktop_xwayland;
 struct weston_desktop_xwayland_interface;
+struct weston_debug_compositor;
 
 struct weston_compositor {
 	struct wl_signal destroy_signal;
@@ -1008,11 +1198,15 @@ struct weston_compositor {
 	struct wl_signal update_input_panel_signal;
 
 	struct wl_signal seat_created_signal;
-	struct wl_signal output_pending_signal;
 	struct wl_signal output_created_signal;
 	struct wl_signal output_destroyed_signal;
 	struct wl_signal output_moved_signal;
 	struct wl_signal output_resized_signal; /* callback argument: resized output */
+
+	/* Signal for output changes triggered by configuration from frontend
+	 * or head state changes from backend.
+	 */
+	struct wl_signal output_heads_changed_signal; /* arg: weston_output */
 
 	struct wl_signal session_signal;
 	int session_active;
@@ -1022,6 +1216,7 @@ struct weston_compositor {
 
 	struct wl_list pending_output_list;
 	struct wl_list output_list;
+	struct wl_list head_list;	/* struct weston_head::compositor_link */
 	struct wl_list seat_list;
 	struct wl_list layer_list;	/* struct weston_layer::link */
 	struct wl_list view_list;	/* struct weston_view::link */
@@ -1084,6 +1279,23 @@ struct weston_compositor {
 	/* Whether to let the compositor run without any input device. */
 	bool require_input;
 
+	/* Signal for a backend to inform a frontend about possible changes
+	 * in head status.
+	 */
+	struct wl_signal heads_changed_signal;
+	struct wl_event_source *heads_changed_source;
+
+	/* Touchscreen calibrator support: */
+	enum weston_touch_mode touch_mode;
+
+	struct wl_global *touch_calibration;
+	weston_touch_calibration_save_func touch_calibration_save;
+	struct weston_layer calibrator_layer;
+	struct weston_touch_calibrator *touch_calibrator;
+
+	struct weston_debug_compositor *weston_debug;
+	struct weston_debug_scope *debug_scene;
+
 	/***
 	 *** IAS-specific additions
 	 ***
@@ -1142,6 +1354,24 @@ struct weston_buffer_viewport {
 	} surface;
 
 	int changed;
+};
+
+struct weston_buffer_release {
+	/* The associated zwp_linux_buffer_release_v1 resource. */
+	struct wl_resource *resource;
+	/* How many weston_buffer_release_reference objects point to this
+	 * object. */
+	uint32_t ref_count;
+	/* The fence fd, if any, associated with this release. If the fence fd
+	 * is -1 then this is considered an immediate release. */
+	int fence_fd;
+};
+
+struct weston_buffer_release_reference {
+	struct weston_buffer_release *buffer_release;
+	/* Listener for the destruction of the wl_resource associated with the
+	 * referenced buffer_release object. */
+	struct wl_listener destroy_listener;
 };
 
 struct weston_region {
@@ -1250,6 +1480,7 @@ struct weston_view {
 	 * view, inheriting the primary output for related views in shells, etc.
 	 */
 	struct weston_output *output;
+	struct wl_listener output_destroy_listener;
 
 	/*
 	 * A more complete representation of all outputs this surface is
@@ -1293,6 +1524,12 @@ struct weston_surface_state {
 	/* wp_viewport.set_source */
 	/* wp_viewport.set_destination */
 	struct weston_buffer_viewport buffer_viewport;
+
+	/* zwp_surface_synchronization_v1.set_acquire_fence */
+	int acquire_fence_fd;
+
+	/* zwp_surface_synchronization_v1.get_release */
+	struct weston_buffer_release_reference buffer_release_ref;
 };
 
 struct weston_surface_activation_data {
@@ -1416,9 +1653,15 @@ struct weston_surface {
 	struct weston_timeline_object timeline;
 
 	bool is_mapped;
+	bool is_opaque;
 
 	/* An list of per seat pointer constraints. */
 	struct wl_list pointer_constraints;
+
+	/* zwp_surface_synchronization_v1 resource for this surface */
+	struct wl_resource *synchronization_resource;
+	int acquire_fence_fd;
+	struct weston_buffer_release_reference buffer_release_ref;
 };
 
 struct weston_subsurface {
@@ -1471,6 +1714,9 @@ enum weston_activate_flag {
 
 void
 weston_version(int *major, int *minor, int *micro);
+
+void
+weston_view_set_output(struct weston_view *view, struct weston_output *output);
 
 void
 weston_view_update_transform(struct weston_view *view);
@@ -1558,13 +1804,50 @@ void
 notify_keyboard_focus_out(struct weston_seat *seat);
 
 void
-notify_touch(struct weston_seat *seat, const struct timespec *time,
-	     int touch_id, double x, double y, int touch_type);
-void
-notify_touch_frame(struct weston_seat *seat);
+notify_touch_normalized(struct weston_touch_device *device,
+			const struct timespec *time,
+			int touch_id,
+			double x, double y,
+			const struct weston_point2d_device_normalized *norm,
+			int touch_type);
+
+/** Feed in touch down, motion, and up events, non-calibratable device.
+ *
+ * @sa notify_touch_cal
+ */
+static inline void
+notify_touch(struct weston_touch_device *device, const struct timespec *time,
+	     int touch_id, double x, double y, int touch_type)
+{
+	notify_touch_normalized(device, time, touch_id, x, y, NULL, touch_type);
+}
 
 void
-notify_touch_cancel(struct weston_seat *seat);
+notify_touch_frame(struct weston_touch_device *device);
+
+void
+notify_touch_cancel(struct weston_touch_device *device);
+
+void
+weston_compositor_set_touch_mode_normal(struct weston_compositor *compositor);
+
+void
+weston_compositor_set_touch_mode_calib(struct weston_compositor *compositor);
+
+void
+touch_calibrator_mode_changed(struct weston_compositor *compositor);
+
+void
+notify_touch_calibrator(struct weston_touch_device *device,
+			const struct timespec *time, int32_t slot,
+			const struct weston_point2d_device_normalized *norm,
+			int touch_type);
+
+void
+notify_touch_calibrator_frame(struct weston_touch_device *device);
+
+void
+notify_touch_calibrator_cancel(struct weston_touch_device *device);
 
 void
 weston_layer_entry_insert(struct weston_layer_entry *list,
@@ -1585,6 +1868,9 @@ weston_layer_set_mask(struct weston_layer *layer, int x, int y, int width, int h
 
 void
 weston_layer_set_mask_infinite(struct weston_layer *layer);
+
+bool
+weston_layer_mask_is_infinite(struct weston_layer *layer);
 
 void
 weston_plane_init(struct weston_plane *plane,
@@ -1764,6 +2050,9 @@ weston_view_set_mask_infinite(struct weston_view *view);
 bool
 weston_view_is_mapped(struct weston_view *view);
 
+bool
+weston_view_is_opaque(struct weston_view *ev, pixman_region32_t *region);
+
 void
 weston_view_schedule_repaint(struct weston_view *view);
 
@@ -1829,7 +2118,18 @@ weston_buffer_reference(struct weston_buffer_reference *ref,
 			struct weston_buffer *buffer);
 
 void
+weston_buffer_release_reference(struct weston_buffer_release_reference *ref,
+				struct weston_buffer_release *buf_release);
+
+void
+weston_buffer_release_move(struct weston_buffer_release_reference *dest,
+			   struct weston_buffer_release_reference *src);
+
+void
 weston_compositor_get_time(struct timespec *time);
+
+char *
+weston_compositor_print_scene_graph(struct weston_compositor *ec);
 
 void
 weston_compositor_destroy(struct weston_compositor *ec);
@@ -1884,6 +2184,12 @@ weston_output_activate_zoom(struct weston_output *output,
 void
 weston_output_move(struct weston_output *output, int x, int y);
 
+void
+weston_output_add_destroy_listener(struct weston_output *output,
+				   struct wl_listener *listener);
+struct wl_listener *
+weston_output_get_destroy_listener(struct weston_output *output,
+				   wl_notify_func_t notify);
 void
 weston_output_release(struct weston_output *output);
 void
@@ -2062,6 +2368,9 @@ weston_transformed_region(int width, int height,
 void *
 weston_load_module(const char *name, const char *entrypoint);
 
+size_t
+weston_module_path_from_env(const char *name, char *path, size_t path_len);
+
 int
 weston_parse_transform(const char *transform, uint32_t *out);
 
@@ -2081,8 +2390,108 @@ void
 weston_seat_set_keyboard_focus(struct weston_seat *seat,
 			       struct weston_surface *surface);
 
+void
+weston_keyboard_send_keymap(struct weston_keyboard *kbd,
+			    struct wl_resource *resource);
+
 int
 weston_compositor_load_xwayland(struct weston_compositor *compositor);
+
+void
+weston_head_init(struct weston_head *head, const char *name);
+
+void
+weston_head_release(struct weston_head *head);
+
+void
+weston_compositor_add_head(struct weston_compositor *compositor,
+			   struct weston_head *head);
+
+void
+weston_head_set_monitor_strings(struct weston_head *head,
+				const char *make,
+				const char *model,
+				const char *serialno);
+
+void
+weston_head_set_non_desktop(struct weston_head *head, bool non_desktop);
+
+void
+weston_head_set_physical_size(struct weston_head *head,
+			      int32_t mm_width, int32_t mm_height);
+
+void
+weston_head_set_subpixel(struct weston_head *head,
+			 enum wl_output_subpixel sp);
+
+void
+weston_head_set_connection_status(struct weston_head *head, bool connected);
+
+void
+weston_head_set_internal(struct weston_head *head);
+
+bool
+weston_head_is_connected(struct weston_head *head);
+
+bool
+weston_head_is_enabled(struct weston_head *head);
+
+bool
+weston_head_is_device_changed(struct weston_head *head);
+
+bool
+weston_head_is_non_desktop(struct weston_head *head);
+
+void
+weston_head_reset_device_changed(struct weston_head *head);
+
+const char *
+weston_head_get_name(struct weston_head *head);
+
+struct weston_output *
+weston_head_get_output(struct weston_head *head);
+
+void
+weston_head_detach(struct weston_head *head);
+
+void
+weston_head_add_destroy_listener(struct weston_head *head,
+				 struct wl_listener *listener);
+
+struct wl_listener *
+weston_head_get_destroy_listener(struct weston_head *head,
+				 wl_notify_func_t notify);
+
+struct weston_head *
+weston_compositor_iterate_heads(struct weston_compositor *compositor,
+				struct weston_head *iter);
+
+void
+weston_compositor_add_heads_changed_listener(struct weston_compositor *compositor,
+					     struct wl_listener *listener);
+
+struct weston_output *
+weston_compositor_find_output_by_name(struct weston_compositor *compositor,
+				      const char *name);
+
+struct weston_output *
+weston_compositor_create_output(struct weston_compositor *compositor,
+				const char *name);
+
+struct weston_output *
+weston_compositor_create_output_with_head(struct weston_compositor *compositor,
+					  struct weston_head *head);
+
+void
+weston_output_destroy(struct weston_output *output);
+
+int
+weston_output_attach_head(struct weston_output *output,
+			  struct weston_head *head);
+
+struct weston_head *
+weston_output_iterate_heads(struct weston_output *output,
+			    struct weston_head *iter);
 
 void
 weston_output_set_scale(struct weston_output *output,
@@ -2108,10 +2517,27 @@ void
 weston_output_disable(struct weston_output *output);
 
 void
-weston_pending_output_coldplug(struct weston_compositor *compositor);
+weston_compositor_flush_heads_changed(struct weston_compositor *compositor);
 
-struct weston_output *
-weston_output_from_resource(struct wl_resource *resource);
+struct weston_head *
+weston_head_from_resource(struct wl_resource *resource);
+
+struct weston_head *
+weston_output_get_first_head(struct weston_output *output);
+
+int
+weston_compositor_enable_touch_calibrator(struct weston_compositor *compositor,
+				weston_touch_calibration_save_func save);
+
+int
+weston_debug_compositor_create(struct weston_compositor *compositor);
+
+void
+weston_debug_compositor_destroy(struct weston_compositor *compositor);
+
+void
+weston_buffer_send_server_error(struct weston_buffer *buffer,
+				      const char *msg);
 
 #ifdef  __cplusplus
 }

@@ -54,6 +54,7 @@ enum {
 };
 
 struct app_state app_state = { 0 };
+struct encoder_options enc_options = { 0 };
 
 static void geometry_event(void *data, struct wl_output *wl_output,
 		int x, int y, int w, int h,
@@ -215,12 +216,10 @@ encoder_init_thread_function(void * const data)
 				app_state->src_width, app_state->src_height,
 				app_state->x, app_state->y,
 				app_state->w, app_state->h,
-				app_state->encoder_tu,
 				app_state->surfid, app_state->hmi,
 				app_state->display,
 				app_state->output_number,
-				app_state->fps,
-				app_state->encoder_qp);
+				app_state->enc_options);
 
 	if (err == 0) {
 		app_state->encoder_state = ENC_STATE_RUN;
@@ -630,6 +629,9 @@ usage(int error_code)
 		"\t--w=<width>\t\t\twidth of region of surface to be captured\n"
 		"\t--h=<height>\t\t\theight of region of surface "
 		"to be captured\n");
+	printf("\t--nv12=<filename>\t\tDump nv12 data to file (quality check only !!)\n"
+		"\t\t\t\t\tThis will generate huge data flow and significanly slow\n"
+		"\t\t\t\t\tdown the encoder process.\n");
 	printf("\t--help\t\t\t\tshow this help text and exit\n\n");
 	printf("Note that all options other than state default to zero.\n"
 		"A width or height of zero is taken to mean that the entire "
@@ -788,6 +790,7 @@ main(int argc, char **argv)
 	int help = 0;
 	int err = 0;
 	memset(&app_state, 0 ,sizeof(app_state));
+	app_state.enc_options = &enc_options;
 	app_state.output_number = -1;
 	const struct weston_option options[] = {
 		{ WESTON_OPTION_INTEGER, "state", 0, &state},
@@ -802,13 +805,14 @@ main(int argc, char **argv)
 		{ WESTON_OPTION_INTEGER, "y", 0, &app_state.y},
 		{ WESTON_OPTION_INTEGER, "w", 0, &app_state.w},
 		{ WESTON_OPTION_INTEGER, "h", 0, &app_state.h},
-		{ WESTON_OPTION_INTEGER, "tu", 0, &app_state.encoder_tu},
-		{ WESTON_OPTION_INTEGER, "fps", 0, &app_state.fps},
-		{ WESTON_OPTION_INTEGER, "qp", 0, &app_state.encoder_qp},
+		{ WESTON_OPTION_INTEGER, "tu", 0, &app_state.enc_options->encoder_tu},
+		{ WESTON_OPTION_INTEGER, "fps", 0, &app_state.enc_options->fps},
+		{ WESTON_OPTION_INTEGER, "qp", 0, &app_state.enc_options->encoder_qp},
+		{ WESTON_OPTION_STRING,  "nv12", 0, &enc_options.nv12_filename},
 		{ WESTON_OPTION_BOOLEAN, "help", 0, &help },
 	};
 
-	app_state.encoder_qp = -1;
+	enc_options.encoder_qp = -1;
 	parse_options(options, ARRAY_LENGTH(options), &argc, argv);
 
 	if (help) {
@@ -835,18 +839,18 @@ main(int argc, char **argv)
 		plugin_fullname_helper();
 	}
 
-	if (app_state.encoder_tu == 0) {
+	if (enc_options.encoder_tu == 0) {
 		/* Default to fastest encode mode. */
-		app_state.encoder_tu = 7;
+		enc_options.encoder_tu = 7;
 	}
 
 	/* Setting to default 24 if unspecified*/
-	if (app_state.encoder_qp < 0) {
-		app_state.encoder_qp = 24;
+	if (enc_options.encoder_qp < 0) {
+		enc_options.encoder_qp = 24;
 	}
 	/* Clipping to table values */
-	if (app_state.encoder_qp > 51) {
-		app_state.encoder_qp = 51;
+	if (enc_options.encoder_qp > 51) {
+		enc_options.encoder_qp = 51;
 	}
 
 	err = init_wl(&app_state);

@@ -1,5 +1,7 @@
 /*
  * Copyright © 2013 Intel Corporation
+ * Copyright 2017-2018 Collabora, Ltd.
+ * Copyright 2017-2018 General Electric Company
  *
  * Permission is hereby granted, free of charge, to any person obtaining
  * a copy of this software and associated documentation files (the
@@ -121,6 +123,74 @@ remove_input_resource_from_timestamps(struct wl_resource *input_resource,
 		if (wl_resource_get_user_data(resource) == input_resource)
 			wl_resource_set_user_data(resource, NULL);
 	}
+}
+
+/** Register a touchscreen input device
+ *
+ * \param touch The parent weston_touch that identifies the seat.
+ * \param syspath Unique device name.
+ * \param backend_data Backend private data if necessary.
+ * \param ops Calibration operations, or NULL for not able to run calibration.
+ * \return New touch device, or NULL on failure.
+ */
+WL_EXPORT struct weston_touch_device *
+weston_touch_create_touch_device(struct weston_touch *touch,
+				 const char *syspath,
+				 void *backend_data,
+				 const struct weston_touch_device_ops *ops)
+{
+	struct weston_touch_device *device;
+
+	assert(syspath);
+	if (ops) {
+		assert(ops->get_output);
+		assert(ops->get_calibration_head_name);
+		assert(ops->get_calibration);
+		assert(ops->set_calibration);
+	}
+
+	device = zalloc(sizeof *device);
+	if (!device)
+		return NULL;
+
+	wl_signal_init(&device->destroy_signal);
+
+	device->syspath = strdup(syspath);
+	if (!device->syspath) {
+		free(device);
+		return NULL;
+	}
+
+	device->backend_data = backend_data;
+	device->ops = ops;
+
+	device->aggregate = touch;
+	wl_list_insert(touch->device_list.prev, &device->link);
+
+	return device;
+}
+
+/** Destroy the touch device. */
+WL_EXPORT void
+weston_touch_device_destroy(struct weston_touch_device *device)
+{
+	wl_list_remove(&device->link);
+	wl_signal_emit(&device->destroy_signal, device);
+	free(device->syspath);
+	free(device);
+}
+
+/** Is it possible to run calibration on this touch device? */
+WL_EXPORT bool
+weston_touch_device_can_calibrate(struct weston_touch_device *device)
+{
+	return !!device->ops;
+}
+
+static enum weston_touch_mode
+weston_touch_device_get_mode(struct weston_touch_device *device)
+{
+	return device->aggregate->seat->compositor->touch_mode;
 }
 
 static struct weston_pointer_client *
@@ -1145,7 +1215,7 @@ weston_pointer_reset_state(struct weston_pointer *pointer)
 static void
 weston_pointer_handle_output_destroy(struct wl_listener *listener, void *data);
 
-WL_EXPORT struct weston_pointer *
+static struct weston_pointer *
 weston_pointer_create(struct weston_seat *seat)
 {
 	struct weston_pointer *pointer;
@@ -1184,7 +1254,7 @@ weston_pointer_create(struct weston_seat *seat)
 	return pointer;
 }
 
-WL_EXPORT void
+static void
 weston_pointer_destroy(struct weston_pointer *pointer)
 {
 	struct weston_pointer_client *pointer_client, *tmp;
@@ -1218,7 +1288,7 @@ weston_pointer_set_default_grab(struct weston_pointer *pointer,
 			&default_pointer_grab_interface;
 }
 
-WL_EXPORT struct weston_keyboard *
+static struct weston_keyboard *
 weston_keyboard_create(void)
 {
 	struct weston_keyboard *keyboard;
@@ -1260,7 +1330,7 @@ weston_xkb_info_destroy(struct weston_xkb_info *xkb_info)
 #endif
 
 
-WL_EXPORT void
+static void
 weston_keyboard_destroy(struct weston_keyboard *keyboard)
 {
 	struct wl_resource *resource;
@@ -1297,7 +1367,7 @@ weston_touch_reset_state(struct weston_touch *touch)
 	touch->num_tp = 0;
 }
 
-WL_EXPORT struct weston_touch *
+static struct weston_touch *
 weston_touch_create(void)
 {
 	struct weston_touch *touch;
@@ -1306,6 +1376,7 @@ weston_touch_create(void)
 	if (touch == NULL)
 		return NULL;
 
+	wl_list_init(&touch->device_list);
 	wl_list_init(&touch->resource_list);
 	wl_list_init(&touch->focus_resource_list);
 	wl_list_init(&touch->focus_view_listener.link);
@@ -1321,10 +1392,12 @@ weston_touch_create(void)
 	return touch;
 }
 
-WL_EXPORT void
+static void
 weston_touch_destroy(struct weston_touch *touch)
 {
 	struct wl_resource *resource;
+
+	assert(wl_list_empty(&touch->device_list));
 
 	wl_resource_for_each(resource, &touch->resource_list) {
 		wl_resource_set_user_data(resource, NULL);
@@ -2073,13 +2146,35 @@ update_modifier_state(struct weston_seat *seat, uint32_t serial, uint32_t key,
 	notify_modifiers(seat, serial);
 }
 
-static void
-send_keymap(struct wl_resource *resource, struct weston_xkb_info *xkb_info)
+WL_EXPORT void
+weston_keyboard_send_keymap(struct weston_keyboard *kbd, struct wl_resource *resource)
 {
+	struct weston_xkb_info *xkb_info = kbd->xkb_info;
+	void *area;
+	int fd;
+
+	fd = os_create_anonymous_file(xkb_info->keymap_size);
+	if (fd < 0) {
+		weston_log("creating a keymap file for %lu bytes failed: %m\n",
+			   (unsigned long) xkb_info->keymap_size);
+		return;
+	}
+
+	area = mmap(NULL, xkb_info->keymap_size, PROT_READ | PROT_WRITE,
+		    MAP_SHARED, fd, 0);
+	if (area == MAP_FAILED) {
+		weston_log("failed to mmap() %lu bytes\n",
+			   (unsigned long) xkb_info->keymap_size);
+		goto err_mmap;
+	}
+	strcpy(area, xkb_info->keymap_string);
+	munmap(area, xkb_info->keymap_size);
 	wl_keyboard_send_keymap(resource,
 				WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1,
-				xkb_info->keymap_fd,
+				fd,
 				xkb_info->keymap_size);
+err_mmap:
+	close(fd);
 }
 
 static void
@@ -2139,9 +2234,9 @@ update_keymap(struct weston_seat *seat)
 	keyboard->xkb_state.state = state;
 
 	wl_resource_for_each(resource, &keyboard->resource_list)
-		send_keymap(resource, xkb_info);
+		weston_keyboard_send_keymap(keyboard, resource);
 	wl_resource_for_each(resource, &keyboard->focus_resource_list)
-		send_keymap(resource, xkb_info);
+		weston_keyboard_send_keymap(keyboard, resource);
 
 	notify_modifiers(seat, wl_display_next_serial(seat->compositor->wl_display));
 
@@ -2354,21 +2449,14 @@ weston_touch_set_focus(struct weston_touch *touch, struct weston_view *view)
 	touch->focus = view;
 }
 
-/**
- * notify_touch - emulates button touches and notifies surfaces accordingly.
- *
- * It assumes always the correct cycle sequence until it gets here: touch_down
- * → touch_update → ... → touch_update → touch_end. The driver is responsible
- * for sending along such order.
- *
- */
-WL_EXPORT void
-notify_touch(struct weston_seat *seat, const struct timespec *time,
-	     int touch_id, double double_x, double double_y, int touch_type)
+static void
+process_touch_normal(struct weston_touch_device *device,
+		     const struct timespec *time, int touch_id,
+		     double double_x, double double_y, int touch_type)
 {
-	struct weston_compositor *ec = seat->compositor;
-	struct weston_touch *touch = weston_seat_get_touch(seat);
-	struct weston_touch_grab *grab = touch->grab;
+	struct weston_touch *touch = device->aggregate;
+	struct weston_touch_grab *grab = device->aggregate->grab;
+	struct weston_compositor *ec = device->aggregate->seat->compositor;
 	struct weston_view *ev;
 	wl_fixed_t sx, sy;
 	wl_fixed_t x = wl_fixed_from_double(double_x);
@@ -2382,10 +2470,6 @@ notify_touch(struct weston_seat *seat, const struct timespec *time,
 
 	switch (touch_type) {
 	case WL_TOUCH_DOWN:
-		weston_compositor_idle_inhibit(ec);
-
-		touch->num_tp++;
-
 		/* the first finger down picks the view, and all further go
 		 * to that view for the remainder of the touch session i.e.
 		 * until all touch points are up again. */
@@ -2427,17 +2511,6 @@ notify_touch(struct weston_seat *seat, const struct timespec *time,
 		grab->interface->motion(grab, time, touch_id, x, y);
 		break;
 	case WL_TOUCH_UP:
-		if (touch->num_tp == 0) {
-			/* This can happen if we start out with one or
-			 * more fingers on the touch screen, in which
-			 * case we didn't get the corresponding down
-			 * event. */
-			weston_log("unmatched touch up event\n");
-			break;
-		}
-		weston_compositor_idle_release(ec);
-		touch->num_tp--;
-
 		grab->interface->up(grab, time, touch_id);
 		if (touch->num_tp == 0 && !ec->input_view)
 			weston_touch_set_focus(touch, NULL);
@@ -2445,22 +2518,224 @@ notify_touch(struct weston_seat *seat, const struct timespec *time,
 	}
 }
 
-WL_EXPORT void
-notify_touch_frame(struct weston_seat *seat)
+static enum weston_touch_mode
+get_next_touch_mode(enum weston_touch_mode from)
 {
-	struct weston_touch *touch = weston_seat_get_touch(seat);
-	struct weston_touch_grab *grab = touch->grab;
+	switch (from) {
+	case WESTON_TOUCH_MODE_PREP_NORMAL:
+		return WESTON_TOUCH_MODE_NORMAL;
 
-	grab->interface->frame(grab);
+	case WESTON_TOUCH_MODE_PREP_CALIB:
+		return WESTON_TOUCH_MODE_CALIB;
+
+	case WESTON_TOUCH_MODE_NORMAL:
+	case WESTON_TOUCH_MODE_CALIB:
+		return from;
+	}
+
+	return WESTON_TOUCH_MODE_NORMAL;
+}
+
+/** Global touch mode update
+ *
+ * If no seat has a touch down and the compositor is in a PREP touch mode,
+ * set the compositor to the goal touch mode.
+ *
+ * Calls calibrator if touch mode changed.
+ */
+static void
+weston_compositor_update_touch_mode(struct weston_compositor *compositor)
+{
+	struct weston_seat *seat;
+	struct weston_touch *touch;
+	enum weston_touch_mode goal;
+
+	wl_list_for_each(seat, &compositor->seat_list, link) {
+		touch = weston_seat_get_touch(seat);
+		if (!touch)
+			continue;
+
+		if (touch->num_tp > 0)
+			return;
+	}
+
+	goal = get_next_touch_mode(compositor->touch_mode);
+	if (compositor->touch_mode != goal) {
+		compositor->touch_mode = goal;
+		touch_calibrator_mode_changed(compositor);
+	}
+}
+
+/** Start transition to normal touch event handling
+ *
+ * The touch event mode changes when all touches on all touch devices have
+ * been lifted. If no touches are currently down, the transition is immediate.
+ *
+ * \sa weston_touch_mode
+ */
+void
+weston_compositor_set_touch_mode_normal(struct weston_compositor *compositor)
+{
+	switch (compositor->touch_mode) {
+	case WESTON_TOUCH_MODE_PREP_NORMAL:
+	case WESTON_TOUCH_MODE_NORMAL:
+		return;
+	case WESTON_TOUCH_MODE_PREP_CALIB:
+		compositor->touch_mode = WESTON_TOUCH_MODE_NORMAL;
+		touch_calibrator_mode_changed(compositor);
+		return;
+	case WESTON_TOUCH_MODE_CALIB:
+		compositor->touch_mode = WESTON_TOUCH_MODE_PREP_NORMAL;
+	}
+
+	weston_compositor_update_touch_mode(compositor);
+}
+
+/** Start transition to calibrator touch event handling
+ *
+ * The touch event mode changes when all touches on all touch devices have
+ * been lifted. If no touches are currently down, the transition is immediate.
+ *
+ * \sa weston_touch_mode
+ */
+void
+weston_compositor_set_touch_mode_calib(struct weston_compositor *compositor)
+{
+	switch (compositor->touch_mode) {
+	case WESTON_TOUCH_MODE_PREP_CALIB:
+	case WESTON_TOUCH_MODE_CALIB:
+		assert(0);
+		return;
+	case WESTON_TOUCH_MODE_PREP_NORMAL:
+		compositor->touch_mode = WESTON_TOUCH_MODE_CALIB;
+		touch_calibrator_mode_changed(compositor);
+		return;
+	case WESTON_TOUCH_MODE_NORMAL:
+		compositor->touch_mode = WESTON_TOUCH_MODE_PREP_CALIB;
+	}
+
+	weston_compositor_update_touch_mode(compositor);
+}
+
+/** Feed in touch down, motion, and up events, calibratable device.
+ *
+ * It assumes always the correct cycle sequence until it gets here: touch_down
+ * → touch_update → ... → touch_update → touch_end. The driver is responsible
+ * for sending along such order.
+ *
+ * \param device The physical device that generated the event.
+ * \param time The event timestamp.
+ * \param touch_id ID for the touch point of this event (multi-touch).
+ * \param double_x X coordinate in compositor global space.
+ * \param double_y Y coordinate in compositor global space.
+ * \param norm Normalized device X, Y coordinates in calibration space, or NULL.
+ * \param touch_type Either WL_TOUCH_DOWN, WL_TOUCH_UP, or WL_TOUCH_MOTION.
+ *
+ * Coordinates double_x and double_y are used for normal operation.
+ *
+ * Coordinates norm are only used for touch device calibration. If and only if
+ * the weston_touch_device does not support calibrating, norm must be NULL.
+ *
+ * The calibration space is the normalized coordinate space
+ * [0.0, 1.0]×[0.0, 1.0] of the weston_touch_device. This is assumed to
+ * map to the similar normalized coordinate space of the associated
+ * weston_output.
+ */
+WL_EXPORT void
+notify_touch_normalized(struct weston_touch_device *device,
+			const struct timespec *time,
+			int touch_id,
+			double x, double y,
+			const struct weston_point2d_device_normalized *norm,
+			int touch_type)
+{
+	struct weston_seat *seat = device->aggregate->seat;
+	struct weston_touch *touch = device->aggregate;
+
+	if (touch_type != WL_TOUCH_UP) {
+		if (weston_touch_device_can_calibrate(device))
+			assert(norm != NULL);
+		else
+			assert(norm == NULL);
+	}
+
+	/* Update touchpoints count regardless of the current mode. */
+	switch (touch_type) {
+	case WL_TOUCH_DOWN:
+		weston_compositor_idle_inhibit(seat->compositor);
+
+		touch->num_tp++;
+		break;
+	case WL_TOUCH_UP:
+		if (touch->num_tp == 0) {
+			/* This can happen if we start out with one or
+			 * more fingers on the touch screen, in which
+			 * case we didn't get the corresponding down
+			 * event. */
+			weston_log("Unmatched touch up event on seat %s, device %s\n",
+				   seat->seat_name, device->syspath);
+			return;
+		}
+		weston_compositor_idle_release(seat->compositor);
+
+		touch->num_tp--;
+		break;
+	default:
+		break;
+	}
+
+	/* Properly forward the touch event */
+	switch (weston_touch_device_get_mode(device)) {
+	case WESTON_TOUCH_MODE_NORMAL:
+	case WESTON_TOUCH_MODE_PREP_CALIB:
+		process_touch_normal(device, time, touch_id, x, y, touch_type);
+		break;
+	case WESTON_TOUCH_MODE_CALIB:
+	case WESTON_TOUCH_MODE_PREP_NORMAL:
+		notify_touch_calibrator(device, time, touch_id,
+					norm, touch_type);
+		break;
+	}
 }
 
 WL_EXPORT void
-notify_touch_cancel(struct weston_seat *seat)
+notify_touch_frame(struct weston_touch_device *device)
 {
-	struct weston_touch *touch = weston_seat_get_touch(seat);
-	struct weston_touch_grab *grab = touch->grab;
+	struct weston_touch_grab *grab;
 
-	grab->interface->cancel(grab);
+	switch (weston_touch_device_get_mode(device)) {
+	case WESTON_TOUCH_MODE_NORMAL:
+	case WESTON_TOUCH_MODE_PREP_CALIB:
+		grab = device->aggregate->grab;
+		grab->interface->frame(grab);
+		break;
+	case WESTON_TOUCH_MODE_CALIB:
+	case WESTON_TOUCH_MODE_PREP_NORMAL:
+		notify_touch_calibrator_frame(device);
+		break;
+	}
+
+	weston_compositor_update_touch_mode(device->aggregate->seat->compositor);
+}
+
+WL_EXPORT void
+notify_touch_cancel(struct weston_touch_device *device)
+{
+	struct weston_touch_grab *grab;
+
+	switch (weston_touch_device_get_mode(device)) {
+	case WESTON_TOUCH_MODE_NORMAL:
+	case WESTON_TOUCH_MODE_PREP_CALIB:
+		grab = device->aggregate->grab;
+		grab->interface->cancel(grab);
+		break;
+	case WESTON_TOUCH_MODE_CALIB:
+	case WESTON_TOUCH_MODE_PREP_NORMAL:
+		notify_touch_calibrator_cancel(device);
+		break;
+	}
+
+	weston_compositor_update_touch_mode(device->aggregate->seat->compositor);
 }
 
 static int
@@ -2723,28 +2998,9 @@ seat_get_keyboard(struct wl_client *client, struct wl_resource *resource,
 					     seat->compositor->kb_repeat_rate,
 					     seat->compositor->kb_repeat_delay);
 	}
-
-	if (seat->compositor->use_xkbcommon) {
 #ifdef ENABLE_XKBCOMMON
-		wl_keyboard_send_keymap(cr, WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1,
-					keyboard->xkb_info->keymap_fd,
-					keyboard->xkb_info->keymap_size);
+	weston_keyboard_send_keymap(keyboard, cr);
 #endif
-	} else {
-		int null_fd = open("/dev/null", O_RDONLY);
-		/*
-		 * Don't send a keymap if there was an error opening this devnode.
-		 * Sending a -1 fd will cause an abort in libwayland-server as it
-		 * tries to duplicate that fd and checks if it is >= 0 and if not
-		 * aborts. This abort will take the compositor down with it.
-		 */
-		if(null_fd != -1) {
-			wl_keyboard_send_keymap(cr, WL_KEYBOARD_KEYMAP_FORMAT_NO_KEYMAP,
-						null_fd,
-						0);
-			close(null_fd);
-		}
-	}
 
 	if (should_send_modifiers_to_client(seat, client)) {
 		send_modifiers_to_resource(keyboard,
@@ -2974,6 +3230,19 @@ weston_compositor_set_xkb_rule_names(struct weston_compositor *ec,
 	return 0;
 }
 
+static void
+weston_xkb_info_destroy(struct weston_xkb_info *xkb_info)
+{
+	if (--xkb_info->ref_count > 0)
+		return;
+
+	xkb_keymap_unref(xkb_info->keymap);
+
+	if (xkb_info->keymap_string)
+		free(xkb_info->keymap_string);
+	free(xkb_info);
+}
+
 void
 weston_compositor_xkb_destroy(struct weston_compositor *ec)
 {
@@ -3005,8 +3274,6 @@ weston_xkb_info_create(struct xkb_keymap *keymap)
 	xkb_info->keymap = xkb_keymap_ref(keymap);
 	xkb_info->ref_count = 1;
 
-	char *keymap_str;
-
 	xkb_info->shift_mod = xkb_keymap_mod_get_index(xkb_info->keymap,
 						       XKB_MOD_NAME_SHIFT);
 	xkb_info->caps_mod = xkb_keymap_mod_get_index(xkb_info->keymap,
@@ -3031,38 +3298,16 @@ weston_xkb_info_create(struct xkb_keymap *keymap)
 	xkb_info->scroll_led = xkb_keymap_led_get_index(xkb_info->keymap,
 							XKB_LED_NAME_SCROLL);
 
-	keymap_str = xkb_keymap_get_as_string(xkb_info->keymap,
-					      XKB_KEYMAP_FORMAT_TEXT_V1);
-	if (keymap_str == NULL) {
+	xkb_info->keymap_string = xkb_keymap_get_as_string(xkb_info->keymap,
+							   XKB_KEYMAP_FORMAT_TEXT_V1);
+	if (xkb_info->keymap_string == NULL) {
 		weston_log("failed to get string version of keymap\n");
 		goto err_keymap;
 	}
-	xkb_info->keymap_size = strlen(keymap_str) + 1;
-
-	xkb_info->keymap_fd = os_create_anonymous_file(xkb_info->keymap_size);
-	if (xkb_info->keymap_fd < 0) {
-		weston_log("creating a keymap file for %lu bytes failed: %m\n",
-			(unsigned long) xkb_info->keymap_size);
-		goto err_keymap_str;
-	}
-
-	xkb_info->keymap_area = mmap(NULL, xkb_info->keymap_size,
-				     PROT_READ | PROT_WRITE,
-				     MAP_SHARED, xkb_info->keymap_fd, 0);
-	if (xkb_info->keymap_area == MAP_FAILED) {
-		weston_log("failed to mmap() %lu bytes\n",
-			(unsigned long) xkb_info->keymap_size);
-		goto err_dev_zero;
-	}
-	strcpy(xkb_info->keymap_area, keymap_str);
-	free(keymap_str);
+	xkb_info->keymap_size = strlen(xkb_info->keymap_string) + 1;
 
 	return xkb_info;
 
-err_dev_zero:
-	close(xkb_info->keymap_fd);
-err_keymap_str:
-	free(keymap_str);
 err_keymap:
 	xkb_keymap_unref(xkb_info->keymap);
 	free(xkb_info);

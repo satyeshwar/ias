@@ -1,6 +1,9 @@
 /*
  * Copyright © 2008-2011 Kristian Høgsberg
  * Copyright © 2011 Intel Corporation
+ * Copyright © 2017, 2018 Collabora, Ltd.
+ * Copyright © 2017, 2018 General Electric Company
+ * Copyright (c) 2018 DisplayLink (UK) Ltd.
  *
  * Permission is hereby granted, free of charge, to any person obtaining
  * a copy of this software and associated documentation files (the
@@ -49,6 +52,7 @@
 
 #include "compositor.h"
 #include "compositor-drm.h"
+#include "weston-debug.h"
 #include "shared/helpers.h"
 #include "shared/timespec-util.h"
 #include "gl-renderer.h"
@@ -62,25 +66,65 @@
 #include "presentation-time-server-protocol.h"
 #include "linux-dmabuf.h"
 #include "linux-dmabuf-unstable-v1-server-protocol.h"
+#include "linux-explicit-synchronization.h"
 
-#ifndef DRM_CAP_TIMESTAMP_MONOTONIC
-#define DRM_CAP_TIMESTAMP_MONOTONIC 0x6
-#endif
-
-#ifndef DRM_CLIENT_CAP_UNIVERSAL_PLANES
-#define DRM_CLIENT_CAP_UNIVERSAL_PLANES 2
-#endif
-
-#ifndef DRM_CAP_CURSOR_WIDTH
-#define DRM_CAP_CURSOR_WIDTH 0x8
-#endif
-
-#ifndef DRM_CAP_CURSOR_HEIGHT
-#define DRM_CAP_CURSOR_HEIGHT 0x9
+#ifndef DRM_CLIENT_CAP_ASPECT_RATIO
+#define DRM_CLIENT_CAP_ASPECT_RATIO	4
 #endif
 
 #ifndef GBM_BO_USE_CURSOR
 #define GBM_BO_USE_CURSOR GBM_BO_USE_CURSOR_64X64
+#endif
+
+#ifndef GBM_BO_USE_LINEAR
+#define GBM_BO_USE_LINEAR (1 << 4)
+#endif
+
+/**
+ * A small wrapper to print information into the 'drm-backend' debug scope.
+ *
+ * The following conventions are used to print variables:
+ *
+ *  - fixed uint32_t values, including Weston object IDs such as weston_output
+ *    IDs, DRM object IDs such as CRTCs or properties, and GBM/DRM formats:
+ *      "%lu (0x%lx)" (unsigned long) value, (unsigned long) value
+ *
+ *  - fixed uint64_t values, such as DRM property values (including object IDs
+ *    when used as a value):
+ *      "%llu (0x%llx)" (unsigned long long) value, (unsigned long long) value
+ *
+ *  - non-fixed-width signed int:
+ *      "%d" value
+ *
+ *  - non-fixed-width unsigned int:
+ *      "%u (0x%x)" value, value
+ *
+ *  - non-fixed-width unsigned long:
+ *      "%lu (0x%lx)" value, value
+ *
+ * Either the integer or hexadecimal forms may be omitted if it is known that
+ * one representation is not useful (e.g. width/height in hex are rarely what
+ * you want).
+ *
+ * This is to avoid implicit widening or narrowing when we use fixed-size
+ * types: uint32_t can be resolved by either unsigned int or unsigned long
+ * on a 32-bit system but only unsigned int on a 64-bit system, with uint64_t
+ * being unsigned long long on a 32-bit system and unsigned long on a 64-bit
+ * system. To avoid confusing side effects, we explicitly cast to the widest
+ * possible type and use a matching format specifier.
+ */
+#define drm_debug(b, ...) \
+	weston_debug_scope_printf((b)->debug, __VA_ARGS__)
+
+#define MAX_CLONED_CONNECTORS 4
+
+/**
+ * aspect ratio info taken from the drmModeModeInfo flag bits 19-22,
+ * which should be used to fill the aspect ratio field in weston_mode.
+ */
+#define DRM_MODE_FLAG_PIC_AR_BITS_POS	19
+#ifndef DRM_MODE_FLAG_PIC_AR_MASK
+#define DRM_MODE_FLAG_PIC_AR_MASK (0xF << DRM_MODE_FLAG_PIC_AR_BITS_POS)
 #endif
 
 /**
@@ -127,6 +171,8 @@ enum wdrm_plane_property {
 	WDRM_PLANE_CRTC_H,
 	WDRM_PLANE_FB_ID,
 	WDRM_PLANE_CRTC_ID,
+	WDRM_PLANE_IN_FORMATS,
+	WDRM_PLANE_IN_FENCE_FD,
 	WDRM_PLANE__COUNT
 };
 
@@ -168,6 +214,8 @@ static const struct drm_property_info plane_props[] = {
 	[WDRM_PLANE_CRTC_H] = { .name = "CRTC_H", },
 	[WDRM_PLANE_FB_ID] = { .name = "FB_ID", },
 	[WDRM_PLANE_CRTC_ID] = { .name = "CRTC_ID", },
+	[WDRM_PLANE_IN_FORMATS] = { .name = "IN_FORMATS" },
+	[WDRM_PLANE_IN_FENCE_FD] = { .name = "IN_FENCE_FD" },
 };
 
 /**
@@ -177,13 +225,42 @@ enum wdrm_connector_property {
 	WDRM_CONNECTOR_EDID = 0,
 	WDRM_CONNECTOR_DPMS,
 	WDRM_CONNECTOR_CRTC_ID,
+	WDRM_CONNECTOR_NON_DESKTOP,
 	WDRM_CONNECTOR__COUNT
+};
+
+enum wdrm_dpms_state {
+	WDRM_DPMS_STATE_OFF = 0,
+	WDRM_DPMS_STATE_ON,
+	WDRM_DPMS_STATE_STANDBY, /* unused */
+	WDRM_DPMS_STATE_SUSPEND, /* unused */
+	WDRM_DPMS_STATE__COUNT
+};
+
+static struct drm_property_enum_info dpms_state_enums[] = {
+	[WDRM_DPMS_STATE_OFF] = {
+		.name = "Off",
+	},
+	[WDRM_DPMS_STATE_ON] = {
+		.name = "On",
+	},
+	[WDRM_DPMS_STATE_STANDBY] = {
+		.name = "Standby",
+	},
+	[WDRM_DPMS_STATE_SUSPEND] = {
+		.name = "Suspend",
+	},
 };
 
 static const struct drm_property_info connector_props[] = {
 	[WDRM_CONNECTOR_EDID] = { .name = "EDID" },
-	[WDRM_CONNECTOR_DPMS] = { .name = "DPMS" },
+	[WDRM_CONNECTOR_DPMS] = {
+		.name = "DPMS",
+		.enum_values = dpms_state_enums,
+		.num_enum_values = WDRM_DPMS_STATE__COUNT,
+	},
 	[WDRM_CONNECTOR_CRTC_ID] = { .name = "CRTC_ID", },
+	[WDRM_CONNECTOR_NON_DESKTOP] = { .name = "non-desktop", },
 };
 
 /**
@@ -214,6 +291,7 @@ enum drm_output_state_duplicate_mode {
 enum drm_state_apply_mode {
 	DRM_STATE_APPLY_SYNC, /**< state fully processed */
 	DRM_STATE_APPLY_ASYNC, /**< state pending event delivery */
+	DRM_STATE_TEST_ONLY, /**< test if the state can be applied */
 };
 
 struct drm_backend {
@@ -250,8 +328,7 @@ struct drm_backend {
 
 	bool state_invalid;
 
-	/* Connector and CRTC IDs not used by any enabled output. */
-	struct wl_array unused_connectors;
+	/* CRTC IDs not used by any enabled output. */
 	struct wl_array unused_crtcs;
 
 	int cursors_are_broken;
@@ -259,7 +336,8 @@ struct drm_backend {
 	bool universal_planes;
 	bool atomic_modeset;
 
-	int use_pixman;
+	bool use_pixman;
+	bool use_pixman_shadow;
 
 	struct udev_input input;
 
@@ -269,6 +347,12 @@ struct drm_backend {
 	uint32_t pageflip_timeout;
 
 	bool shutting_down;
+
+	bool aspect_ratio_supported;
+
+	bool fb_modifiers;
+
+	struct weston_debug_scope *debug;
 };
 
 struct drm_mode {
@@ -280,6 +364,7 @@ struct drm_mode {
 enum drm_fb_type {
 	BUFFER_INVALID = 0, /**< never used */
 	BUFFER_CLIENT, /**< directly sourced from client */
+	BUFFER_DMABUF, /**< imported from linux_dmabuf client */
 	BUFFER_PIXMAN_DUMB, /**< internal Pixman rendering */
 	BUFFER_GBM_SURFACE, /**< internal EGL rendering */
 	BUFFER_CURSOR, /**< internal cursor buffer */
@@ -290,11 +375,17 @@ struct drm_fb {
 
 	int refcnt;
 
-	uint32_t fb_id, stride, handle, size;
+	uint32_t fb_id, size;
+	uint32_t handles[4];
+	uint32_t strides[4];
+	uint32_t offsets[4];
+	int num_planes;
 	const struct pixel_format_info *format;
+	uint64_t modifier;
 	int width, height;
 	int fd;
 	struct weston_buffer_reference buffer_ref;
+	struct weston_buffer_release_reference buffer_release_ref;
 
 	/* Used by gbm fbs */
 	struct gbm_bo *bo;
@@ -320,6 +411,12 @@ struct drm_edid {
 struct drm_pending_state {
 	struct drm_backend *backend;
 	struct wl_list output_list;
+};
+
+enum drm_output_propose_state_mode {
+	DRM_OUTPUT_PROPOSE_STATE_MIXED, /**< mix renderer & planes */
+	DRM_OUTPUT_PROPOSE_STATE_RENDERER_ONLY, /**< only assign to renderer & cursor */
+	DRM_OUTPUT_PROPOSE_STATE_PLANES_ONLY, /**< no renderer use, only planes */
 };
 
 /*
@@ -354,12 +451,17 @@ struct drm_plane_state {
 
 	struct drm_fb *fb;
 
+	struct weston_view *ev; /**< maintained for drm_assign_planes only */
+
 	int32_t src_x, src_y;
 	uint32_t src_w, src_h;
 	int32_t dest_x, dest_y;
 	uint32_t dest_w, dest_h;
 
 	bool complete;
+
+	/* We don't own the fd, so we shouldn't close it */
+	int in_fence_fd;
 
 	struct wl_list link; /* drm_output_state::plane_list */
 };
@@ -397,24 +499,39 @@ struct drm_plane {
 
 	struct wl_list link;
 
-	uint32_t formats[];
+	struct {
+		uint32_t format;
+		uint32_t count_modifiers;
+		uint64_t *modifiers;
+	} formats[];
 };
 
-struct drm_output {
-	struct weston_output base;
-	drmModeConnector *connector;
+struct drm_head {
+	struct weston_head base;
+	struct drm_backend *backend;
 
-	uint32_t crtc_id; /* object ID to pass to DRM functions */
-	int pipe; /* index of CRTC in resource array / bitmasks */
+	drmModeConnector *connector;
 	uint32_t connector_id;
 	struct drm_edid edid;
 
 	/* Holds the properties for the connector */
 	struct drm_property_info props_conn[WDRM_CONNECTOR__COUNT];
-	/* Holds the properties for the CRTC */
-	struct drm_property_info props_crtc[WDRM_CRTC__COUNT];
 
 	struct backlight *backlight;
+
+	drmModeModeInfo inherited_mode;	/**< Original mode on the connector */
+	uint32_t inherited_crtc_id;	/**< Original CRTC assignment */
+};
+
+struct drm_output {
+	struct weston_output base;
+	struct drm_backend *backend;
+
+	uint32_t crtc_id; /* object ID to pass to DRM functions */
+	int pipe; /* index of CRTC in resource array / bitmasks */
+
+	/* Holds the properties for the CRTC */
+	struct drm_property_info props_crtc[WDRM_CRTC__COUNT];
 
 	int vblank_pending;
 	int page_flip_pending;
@@ -430,6 +547,7 @@ struct drm_output {
 
 	struct gbm_surface *gbm_surface;
 	uint32_t gbm_format;
+	uint32_t gbm_bo_flags;
 
 	/* Plane being displayed directly on the CRTC */
 	struct drm_plane *scanout_plane;
@@ -449,6 +567,24 @@ struct drm_output {
 	struct wl_listener recorder_frame_listener;
 
 	struct wl_event_source *pageflip_timer;
+
+	bool virtual;
+
+	submit_frame_cb virtual_submit_frame;
+};
+
+static const char *const aspect_ratio_as_string[] = {
+	[WESTON_MODE_PIC_AR_NONE] = "",
+	[WESTON_MODE_PIC_AR_4_3] = " 4:3",
+	[WESTON_MODE_PIC_AR_16_9] = " 16:9",
+	[WESTON_MODE_PIC_AR_64_27] = " 64:27",
+	[WESTON_MODE_PIC_AR_256_135] = " 256:135",
+};
+
+static const char *const drm_output_propose_state_mode_as_string[] = {
+	[DRM_OUTPUT_PROPOSE_STATE_MIXED] = "mixed state",
+	[DRM_OUTPUT_PROPOSE_STATE_RENDERER_ONLY] = "render-only state",
+	[DRM_OUTPUT_PROPOSE_STATE_PLANES_ONLY]	= "plane-only state"
 };
 
 static struct gl_renderer_interface *gl_renderer;
@@ -473,6 +609,12 @@ wl_array_remove_uint32(struct wl_array *array, uint32_t elm)
 		memmove(pos, pos + 1, (char *) end -  (char *) (pos + 1));
 		break;
 	}
+}
+
+static inline struct drm_head *
+to_drm_head(struct weston_head *base)
+{
+	return container_of(base, struct drm_head, base);
 }
 
 static inline struct drm_output *
@@ -548,7 +690,7 @@ to_drm_mode(struct weston_mode *base)
  */
 static uint64_t
 drm_property_get_value(struct drm_property_info *info,
-		       drmModeObjectPropertiesPtr props,
+		       const drmModeObjectProperties *props,
 		       uint64_t def)
 {
 	unsigned int i;
@@ -747,6 +889,9 @@ drm_output_update_msc(struct drm_output *output, unsigned int seq);
 static void
 drm_output_destroy(struct weston_output *output_base);
 
+static void
+drm_virtual_output_destroy(struct weston_output *output_base);
+
 /**
  * Returns true if the plane can be used on the given output for its current
  * repaint cycle.
@@ -755,6 +900,9 @@ static bool
 drm_plane_is_available(struct drm_plane *plane, struct drm_output *output)
 {
 	assert(plane->state_cur);
+
+	if (output->virtual)
+		return false;
 
 	/* The plane still has a request not yet completed by the kernel. */
 	if (!plane->state_cur->complete)
@@ -779,29 +927,20 @@ drm_output_find_by_crtc(struct drm_backend *b, uint32_t crtc_id)
 			return output;
 	}
 
-	wl_list_for_each(output, &b->compositor->pending_output_list,
-			 base.link) {
-		if (output->crtc_id == crtc_id)
-			return output;
-	}
-
 	return NULL;
 }
 
-static struct drm_output *
-drm_output_find_by_connector(struct drm_backend *b, uint32_t connector_id)
+static struct drm_head *
+drm_head_find_by_connector(struct drm_backend *backend, uint32_t connector_id)
 {
-	struct drm_output *output;
+	struct weston_head *base;
+	struct drm_head *head;
 
-	wl_list_for_each(output, &b->compositor->output_list, base.link) {
-		if (output->connector_id == connector_id)
-			return output;
-	}
-
-	wl_list_for_each(output, &b->compositor->pending_output_list,
-			 base.link) {
-		if (output->connector_id == connector_id)
-			return output;
+	wl_list_for_each(base,
+			 &backend->compositor->head_list, compositor_link) {
+		head = to_drm_head(base);
+		if (head->connector_id == connector_id)
+			return head;
 	}
 
 	return NULL;
@@ -813,6 +952,7 @@ drm_fb_destroy(struct drm_fb *fb)
 	if (fb->fb_id != 0)
 		drmModeRmFB(fb->fd, fb->fb_id);
 	weston_buffer_reference(&fb->buffer_ref, NULL);
+	weston_buffer_release_reference(&fb->buffer_release_ref, NULL);
 	free(fb);
 }
 
@@ -827,7 +967,7 @@ drm_fb_destroy_dumb(struct drm_fb *fb)
 		munmap(fb->map, fb->size);
 
 	memset(&destroy_arg, 0, sizeof(destroy_arg));
-	destroy_arg.handle = fb->handle;
+	destroy_arg.handle = fb->handles[0];
 	drmIoctl(fb->fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy_arg);
 
 	drm_fb_destroy(fb);
@@ -843,6 +983,53 @@ drm_fb_destroy_gbm(struct gbm_bo *bo, void *data)
 	drm_fb_destroy(fb);
 }
 
+static int
+drm_fb_addfb(struct drm_backend *b, struct drm_fb *fb)
+{
+	int ret = -EINVAL;
+#ifdef HAVE_DRM_ADDFB2_MODIFIERS
+	uint64_t mods[4] = { };
+	size_t i;
+#endif
+
+	/* If we have a modifier set, we must only use the WithModifiers
+	 * entrypoint; we cannot import it through legacy ioctls. */
+	if (b->fb_modifiers && fb->modifier != DRM_FORMAT_MOD_INVALID) {
+		/* KMS demands that if a modifier is set, it must be the same
+		 * for all planes. */
+#ifdef HAVE_DRM_ADDFB2_MODIFIERS
+		for (i = 0; i < ARRAY_LENGTH(mods) && fb->handles[i]; i++)
+			mods[i] = fb->modifier;
+		ret = drmModeAddFB2WithModifiers(fb->fd, fb->width, fb->height,
+						 fb->format->format,
+						 fb->handles, fb->strides,
+						 fb->offsets, mods, &fb->fb_id,
+						 DRM_MODE_FB_MODIFIERS);
+#endif
+		return ret;
+	}
+
+	ret = drmModeAddFB2(fb->fd, fb->width, fb->height, fb->format->format,
+			    fb->handles, fb->strides, fb->offsets, &fb->fb_id,
+			    0);
+	if (ret == 0)
+		return 0;
+
+	/* Legacy AddFB can't always infer the format from depth/bpp alone, so
+	 * check if our format is one of the lucky ones. */
+	if (!fb->format->depth || !fb->format->bpp)
+		return ret;
+
+	/* Cannot fall back to AddFB for multi-planar formats either. */
+	if (fb->handles[1] || fb->handles[2] || fb->handles[3])
+		return ret;
+
+	ret = drmModeAddFB(fb->fd, fb->width, fb->height,
+			   fb->format->depth, fb->format->bpp,
+			   fb->strides[0], fb->handles[0], &fb->fb_id);
+	return ret;
+}
+
 static struct drm_fb *
 drm_fb_create_dumb(struct drm_backend *b, int width, int height,
 		   uint32_t format)
@@ -853,12 +1040,10 @@ drm_fb_create_dumb(struct drm_backend *b, int width, int height,
 	struct drm_mode_create_dumb create_arg;
 	struct drm_mode_destroy_dumb destroy_arg;
 	struct drm_mode_map_dumb map_arg;
-	uint32_t handles[4] = { 0 }, pitches[4] = { 0 }, offsets[4] = { 0 };
 
 	fb = zalloc(sizeof *fb);
 	if (!fb)
 		return NULL;
-
 	fb->refcnt = 1;
 
 	fb->format = pixel_format_get_info(format);
@@ -884,30 +1069,22 @@ drm_fb_create_dumb(struct drm_backend *b, int width, int height,
 		goto err_fb;
 
 	fb->type = BUFFER_PIXMAN_DUMB;
-	fb->handle = create_arg.handle;
-	fb->stride = create_arg.pitch;
+	fb->modifier = DRM_FORMAT_MOD_INVALID;
+	fb->handles[0] = create_arg.handle;
+	fb->strides[0] = create_arg.pitch;
+	fb->num_planes = 1;
 	fb->size = create_arg.size;
 	fb->width = width;
 	fb->height = height;
 	fb->fd = b->drm.fd;
 
-	handles[0] = fb->handle;
-	pitches[0] = fb->stride;
-	offsets[0] = 0;
-
-	ret = drmModeAddFB2(b->drm.fd, width, height, fb->format->format,
-			    handles, pitches, offsets, &fb->fb_id, 0);
-	if (ret) {
-		ret = drmModeAddFB(b->drm.fd, width, height,
-				   fb->format->depth, fb->format->bpp,
-				   fb->stride, fb->handle, &fb->fb_id);
+	if (drm_fb_addfb(b, fb) != 0) {
+		weston_log("failed to create kms fb: %m\n");
+		goto err_bo;
 	}
 
-	if (ret)
-		goto err_bo;
-
 	memset(&map_arg, 0, sizeof map_arg);
-	map_arg.handle = fb->handle;
+	map_arg.handle = fb->handles[0];
 	ret = drmIoctl(fb->fd, DRM_IOCTL_MODE_MAP_DUMB, &map_arg);
 	if (ret)
 		goto err_add_fb;
@@ -937,42 +1114,127 @@ drm_fb_ref(struct drm_fb *fb)
 	return fb;
 }
 
-static struct drm_fb *
-drm_fb_get_from_bo(struct gbm_bo *bo, struct drm_backend *backend,
-		   uint32_t format, enum drm_fb_type type)
+static void
+drm_fb_destroy_dmabuf(struct drm_fb *fb)
 {
-	struct drm_fb *fb = gbm_bo_get_user_data(bo);
-	uint32_t handles[4] = { 0 }, pitches[4] = { 0 }, offsets[4] = { 0 };
-	int ret;
+	/* We deliberately do not close the GEM handles here; GBM manages
+	 * their lifetime through the BO. */
+	if (fb->bo)
+		gbm_bo_destroy(fb->bo);
+	drm_fb_destroy(fb);
+}
 
-	if (fb) {
-		assert(fb->type == type);
-		return drm_fb_ref(fb);
-	}
+static struct drm_fb *
+drm_fb_get_from_dmabuf(struct linux_dmabuf_buffer *dmabuf,
+		       struct drm_backend *backend, bool is_opaque)
+{
+#ifdef HAVE_GBM_FD_IMPORT
+	struct drm_fb *fb;
+	struct gbm_import_fd_data import_legacy = {
+		.width = dmabuf->attributes.width,
+		.height = dmabuf->attributes.height,
+		.format = dmabuf->attributes.format,
+		.stride = dmabuf->attributes.stride[0],
+		.fd = dmabuf->attributes.fd[0],
+	};
+	struct gbm_import_fd_modifier_data import_mod = {
+		.width = dmabuf->attributes.width,
+		.height = dmabuf->attributes.height,
+		.format = dmabuf->attributes.format,
+		.num_fds = dmabuf->attributes.n_planes,
+		.modifier = dmabuf->attributes.modifier[0],
+	};
+	int i;
 
-	assert(format != 0);
+	/* XXX: TODO:
+	 *
+	 * Currently the buffer is rejected if any dmabuf attribute
+	 * flag is set.  This keeps us from passing an inverted /
+	 * interlaced / bottom-first buffer (or any other type that may
+	 * be added in the future) through to an overlay.  Ultimately,
+	 * these types of buffers should be handled through buffer
+	 * transforms and not as spot-checks requiring specific
+	 * knowledge. */
+	if (dmabuf->attributes.flags)
+		return NULL;
 
 	fb = zalloc(sizeof *fb);
 	if (fb == NULL)
 		return NULL;
 
-	fb->type = type;
 	fb->refcnt = 1;
-	fb->bo = bo;
+	fb->type = BUFFER_DMABUF;
 
-	fb->width = gbm_bo_get_width(bo);
-	fb->height = gbm_bo_get_height(bo);
-	fb->stride = gbm_bo_get_stride(bo);
-	fb->handle = gbm_bo_get_handle(bo).u32;
-	fb->format = pixel_format_get_info(format);
-	fb->size = fb->stride * fb->height;
+	static_assert(ARRAY_LENGTH(import_mod.fds) ==
+		      ARRAY_LENGTH(dmabuf->attributes.fd),
+		      "GBM and linux_dmabuf FD size must match");
+	static_assert(sizeof(import_mod.fds) == sizeof(dmabuf->attributes.fd),
+		      "GBM and linux_dmabuf FD size must match");
+	memcpy(import_mod.fds, dmabuf->attributes.fd, sizeof(import_mod.fds));
+
+	static_assert(ARRAY_LENGTH(import_mod.strides) ==
+		      ARRAY_LENGTH(dmabuf->attributes.stride),
+		      "GBM and linux_dmabuf stride size must match");
+	static_assert(sizeof(import_mod.strides) ==
+		      sizeof(dmabuf->attributes.stride),
+		      "GBM and linux_dmabuf stride size must match");
+	memcpy(import_mod.strides, dmabuf->attributes.stride,
+	       sizeof(import_mod.strides));
+
+	static_assert(ARRAY_LENGTH(import_mod.offsets) ==
+		      ARRAY_LENGTH(dmabuf->attributes.offset),
+		      "GBM and linux_dmabuf offset size must match");
+	static_assert(sizeof(import_mod.offsets) ==
+		      sizeof(dmabuf->attributes.offset),
+		      "GBM and linux_dmabuf offset size must match");
+	memcpy(import_mod.offsets, dmabuf->attributes.offset,
+	       sizeof(import_mod.offsets));
+
+	/* The legacy FD-import path does not allow us to supply modifiers,
+	 * multiple planes, or buffer offsets. */
+	if (dmabuf->attributes.modifier[0] != DRM_FORMAT_MOD_INVALID ||
+	    import_mod.num_fds > 1 ||
+	    import_mod.offsets[0] > 0) {
+		fb->bo = gbm_bo_import(backend->gbm, GBM_BO_IMPORT_FD_MODIFIER,
+				       &import_mod,
+				       GBM_BO_USE_SCANOUT);
+	} else {
+		fb->bo = gbm_bo_import(backend->gbm, GBM_BO_IMPORT_FD,
+				       &import_legacy,
+				       GBM_BO_USE_SCANOUT);
+	}
+
+	if (!fb->bo)
+		goto err_free;
+
+	fb->width = dmabuf->attributes.width;
+	fb->height = dmabuf->attributes.height;
+	fb->modifier = dmabuf->attributes.modifier[0];
+	fb->size = 0;
 	fb->fd = backend->drm.fd;
 
+	static_assert(ARRAY_LENGTH(fb->strides) ==
+		      ARRAY_LENGTH(dmabuf->attributes.stride),
+		      "drm_fb and dmabuf stride size must match");
+	static_assert(sizeof(fb->strides) == sizeof(dmabuf->attributes.stride),
+		      "drm_fb and dmabuf stride size must match");
+	memcpy(fb->strides, dmabuf->attributes.stride, sizeof(fb->strides));
+	static_assert(ARRAY_LENGTH(fb->offsets) ==
+		      ARRAY_LENGTH(dmabuf->attributes.offset),
+		      "drm_fb and dmabuf offset size must match");
+	static_assert(sizeof(fb->offsets) == sizeof(dmabuf->attributes.offset),
+		      "drm_fb and dmabuf offset size must match");
+	memcpy(fb->offsets, dmabuf->attributes.offset, sizeof(fb->offsets));
+
+	fb->format = pixel_format_get_info(dmabuf->attributes.format);
 	if (!fb->format) {
-		weston_log("couldn't look up format 0x%lx\n",
-			   (unsigned long) format);
+		weston_log("couldn't look up format info for 0x%lx\n",
+			   (unsigned long) dmabuf->attributes.format);
 		goto err_free;
 	}
+
+	if (is_opaque)
+		fb->format = pixel_format_get_opaque_substitute(fb->format);
 
 	if (backend->min_width > fb->width ||
 	    fb->width > backend->max_width ||
@@ -982,20 +1244,92 @@ drm_fb_get_from_bo(struct gbm_bo *bo, struct drm_backend *backend,
 		goto err_free;
 	}
 
-	handles[0] = fb->handle;
-	pitches[0] = fb->stride;
-	offsets[0] = 0;
+	fb->num_planes = dmabuf->attributes.n_planes;
+	for (i = 0; i < dmabuf->attributes.n_planes; i++) {
+		union gbm_bo_handle handle;
 
-	ret = drmModeAddFB2(backend->drm.fd, fb->width, fb->height,
-			    fb->format->format, handles, pitches, offsets,
-			    &fb->fb_id, 0);
-	if (ret && fb->format->depth && fb->format->bpp)
-		ret = drmModeAddFB(backend->drm.fd, fb->width, fb->height,
-				   fb->format->depth, fb->format->bpp,
-				   fb->stride, fb->handle, &fb->fb_id);
+	        handle = gbm_bo_get_handle_for_plane(fb->bo, i);
+		if (handle.s32 == -1)
+			goto err_free;
+		fb->handles[i] = handle.u32;
+	}
 
-	if (ret) {
-		weston_log("failed to create kms fb: %m\n");
+	if (drm_fb_addfb(backend, fb) != 0)
+		goto err_free;
+
+	return fb;
+
+err_free:
+	drm_fb_destroy_dmabuf(fb);
+#endif
+	return NULL;
+}
+
+static struct drm_fb *
+drm_fb_get_from_bo(struct gbm_bo *bo, struct drm_backend *backend,
+		   bool is_opaque, enum drm_fb_type type)
+{
+	struct drm_fb *fb = gbm_bo_get_user_data(bo);
+#ifdef HAVE_GBM_MODIFIERS
+	int i;
+#endif
+
+	if (fb) {
+		assert(fb->type == type);
+		return drm_fb_ref(fb);
+	}
+
+	fb = zalloc(sizeof *fb);
+	if (fb == NULL)
+		return NULL;
+
+	fb->type = type;
+	fb->refcnt = 1;
+	fb->bo = bo;
+	fb->fd = backend->drm.fd;
+
+	fb->width = gbm_bo_get_width(bo);
+	fb->height = gbm_bo_get_height(bo);
+	fb->format = pixel_format_get_info(gbm_bo_get_format(bo));
+	fb->size = 0;
+
+#ifdef HAVE_GBM_MODIFIERS
+	fb->modifier = gbm_bo_get_modifier(bo);
+	fb->num_planes = gbm_bo_get_plane_count(bo);
+	for (i = 0; i < fb->num_planes; i++) {
+		fb->strides[i] = gbm_bo_get_stride_for_plane(bo, i);
+		fb->handles[i] = gbm_bo_get_handle_for_plane(bo, i).u32;
+		fb->offsets[i] = gbm_bo_get_offset(bo, i);
+	}
+#else
+	fb->num_planes = 1;
+	fb->strides[0] = gbm_bo_get_stride(bo);
+	fb->handles[0] = gbm_bo_get_handle(bo).u32;
+	fb->modifier = DRM_FORMAT_MOD_INVALID;
+#endif
+
+	if (!fb->format) {
+		weston_log("couldn't look up format 0x%lx\n",
+			   (unsigned long) gbm_bo_get_format(bo));
+		goto err_free;
+	}
+
+	/* We can scanout an ARGB buffer if the surface's opaque region covers
+	 * the whole output, but we have to use XRGB as the KMS format code. */
+	if (is_opaque)
+		fb->format = pixel_format_get_opaque_substitute(fb->format);
+
+	if (backend->min_width > fb->width ||
+	    fb->width > backend->max_width ||
+	    backend->min_height > fb->height ||
+	    fb->height > backend->max_height) {
+		weston_log("bo geometry out of bounds\n");
+		goto err_free;
+	}
+
+	if (drm_fb_addfb(backend, fb) != 0) {
+		if (type == BUFFER_GBM_SURFACE)
+			weston_log("failed to create kms fb: %m\n");
 		goto err_free;
 	}
 
@@ -1009,11 +1343,14 @@ err_free:
 }
 
 static void
-drm_fb_set_buffer(struct drm_fb *fb, struct weston_buffer *buffer)
+drm_fb_set_buffer(struct drm_fb *fb, struct weston_buffer *buffer,
+		  struct weston_buffer_release *buffer_release)
 {
 	assert(fb->buffer_ref.buffer == NULL);
-	assert(fb->type == BUFFER_CLIENT);
+	assert(fb->type == BUFFER_CLIENT || fb->type == BUFFER_DMABUF);
 	weston_buffer_reference(&fb->buffer_ref, buffer);
+	weston_buffer_release_reference(&fb->buffer_release_ref,
+					buffer_release);
 }
 
 static void
@@ -1037,6 +1374,9 @@ drm_fb_unref(struct drm_fb *fb)
 	case BUFFER_GBM_SURFACE:
 		gbm_surface_release_buffer(fb->gbm_surface, fb->bo);
 		break;
+	case BUFFER_DMABUF:
+		drm_fb_destroy_dmabuf(fb);
+		break;
 	default:
 		assert(NULL);
 		break;
@@ -1055,6 +1395,7 @@ drm_plane_state_alloc(struct drm_output_state *state_output,
 	assert(state);
 	state->output_state = state_output;
 	state->plane = plane;
+	state->in_fence_fd = -1;
 
 	/* Here we only add the plane state to the desired link, and not
 	 * set the member. Having an output pointer set means that the
@@ -1085,6 +1426,7 @@ drm_plane_state_free(struct drm_plane_state *state, bool force)
 	wl_list_remove(&state->link);
 	wl_list_init(&state->link);
 	state->output_state = NULL;
+	state->in_fence_fd = -1;
 
 	if (force || state != state->plane->state_cur) {
 		drm_fb_unref(state->fb);
@@ -1158,6 +1500,167 @@ drm_plane_state_put_back(struct drm_plane_state *state)
 		return;
 
 	(void) drm_plane_state_alloc(state_output, plane);
+}
+
+static bool
+drm_view_transform_supported(struct weston_view *ev, struct weston_output *output)
+{
+	struct weston_buffer_viewport *viewport = &ev->surface->buffer_viewport;
+
+	/* This will incorrectly disallow cases where the combination of
+	 * buffer and view transformations match the output transform.
+	 * Fixing this requires a full analysis of the transformation
+	 * chain. */
+	if (ev->transform.enabled &&
+	    ev->transform.matrix.type >= WESTON_MATRIX_TRANSFORM_ROTATE)
+		return false;
+
+	if (viewport->buffer.transform != output->transform)
+		return false;
+
+	return true;
+}
+
+/**
+ * Given a weston_view, fill the drm_plane_state's co-ordinates to display on
+ * a given plane.
+ */
+static bool
+drm_plane_state_coords_for_view(struct drm_plane_state *state,
+				struct weston_view *ev)
+{
+	struct drm_output *output = state->output;
+	struct weston_buffer *buffer = ev->surface->buffer_ref.buffer;
+	pixman_region32_t dest_rect, src_rect;
+	pixman_box32_t *box, tbox;
+	float sxf1, syf1, sxf2, syf2;
+
+	if (!drm_view_transform_supported(ev, &output->base))
+		return false;
+
+	/* Update the base weston_plane co-ordinates. */
+	box = pixman_region32_extents(&ev->transform.boundingbox);
+	state->plane->base.x = box->x1;
+	state->plane->base.y = box->y1;
+
+	/* First calculate the destination co-ordinates by taking the
+	 * area of the view which is visible on this output, performing any
+	 * transforms to account for output rotation and scale as necessary. */
+	pixman_region32_init(&dest_rect);
+	pixman_region32_intersect(&dest_rect, &ev->transform.boundingbox,
+				  &output->base.region);
+	pixman_region32_translate(&dest_rect, -output->base.x, -output->base.y);
+	box = pixman_region32_extents(&dest_rect);
+	tbox = weston_transformed_rect(output->base.width,
+				       output->base.height,
+				       output->base.transform,
+				       output->base.current_scale,
+				       *box);
+	state->dest_x = tbox.x1;
+	state->dest_y = tbox.y1;
+	state->dest_w = tbox.x2 - tbox.x1;
+	state->dest_h = tbox.y2 - tbox.y1;
+	pixman_region32_fini(&dest_rect);
+
+	/* Now calculate the source rectangle, by finding the extents of the
+	 * view, and working backwards to source co-ordinates. */
+	pixman_region32_init(&src_rect);
+	pixman_region32_intersect(&src_rect, &ev->transform.boundingbox,
+				  &output->base.region);
+	box = pixman_region32_extents(&src_rect);
+	weston_view_from_global_float(ev, box->x1, box->y1, &sxf1, &syf1);
+	weston_surface_to_buffer_float(ev->surface, sxf1, syf1, &sxf1, &syf1);
+	weston_view_from_global_float(ev, box->x2, box->y2, &sxf2, &syf2);
+	weston_surface_to_buffer_float(ev->surface, sxf2, syf2, &sxf2, &syf2);
+	pixman_region32_fini(&src_rect);
+
+	/* Buffer transforms may mean that x2 is to the left of x1, and/or that
+	 * y2 is above y1. */
+	if (sxf2 < sxf1) {
+		double tmp = sxf1;
+		sxf1 = sxf2;
+		sxf2 = tmp;
+	}
+	if (syf2 < syf1) {
+		double tmp = syf1;
+		syf1 = syf2;
+		syf2 = tmp;
+	}
+
+	/* Shift from S23.8 wl_fixed to U16.16 KMS fixed-point encoding. */
+	state->src_x = wl_fixed_from_double(sxf1) << 8;
+	state->src_y = wl_fixed_from_double(syf1) << 8;
+	state->src_w = wl_fixed_from_double(sxf2 - sxf1) << 8;
+	state->src_h = wl_fixed_from_double(syf2 - syf1) << 8;
+
+	/* Clamp our source co-ordinates to surface bounds; it's possible
+	 * for intermediate translations to give us slightly incorrect
+	 * co-ordinates if we have, for example, multiple zooming
+	 * transformations. View bounding boxes are also explicitly rounded
+	 * greedily. */
+	if (state->src_x < 0)
+		state->src_x = 0;
+	if (state->src_y < 0)
+		state->src_y = 0;
+	if (state->src_w > (uint32_t) ((buffer->width << 16) - state->src_x))
+		state->src_w = (buffer->width << 16) - state->src_x;
+	if (state->src_h > (uint32_t) ((buffer->height << 16) - state->src_y))
+		state->src_h = (buffer->height << 16) - state->src_y;
+
+	return true;
+}
+
+static struct drm_fb *
+drm_fb_get_from_view(struct drm_output_state *state, struct weston_view *ev)
+{
+	struct drm_output *output = state->output;
+	struct drm_backend *b = to_drm_backend(output->base.compositor);
+	struct weston_buffer *buffer = ev->surface->buffer_ref.buffer;
+	bool is_opaque = weston_view_is_opaque(ev, &ev->transform.boundingbox);
+	struct linux_dmabuf_buffer *dmabuf;
+	struct drm_fb *fb;
+
+	if (ev->alpha != 1.0f)
+		return NULL;
+
+	if (!drm_view_transform_supported(ev, &output->base))
+		return NULL;
+
+	if (!buffer)
+		return NULL;
+
+	if (wl_shm_buffer_get(buffer->resource))
+		return NULL;
+
+	/* GBM is used for dmabuf import as well as from client wl_buffer. */
+	if (!b->gbm)
+		return NULL;
+
+	dmabuf = linux_dmabuf_buffer_get(buffer->resource);
+	if (dmabuf) {
+		fb = drm_fb_get_from_dmabuf(dmabuf, b, is_opaque);
+		if (!fb)
+			return NULL;
+	} else {
+		struct gbm_bo *bo;
+
+		bo = gbm_bo_import(b->gbm, GBM_BO_IMPORT_WL_BUFFER,
+				   buffer->resource, GBM_BO_USE_SCANOUT);
+		if (!bo)
+			return NULL;
+
+		fb = drm_fb_get_from_bo(bo, b, is_opaque, BUFFER_CLIENT);
+		if (!fb) {
+			gbm_bo_destroy(bo);
+			return NULL;
+		}
+	}
+
+	drm_debug(b, "\t\t\t[view] view %p format: %s\n",
+		  ev, fb->format->drm_format_name);
+	drm_fb_set_buffer(fb, buffer,
+			  ev->surface->buffer_release_ref.buffer_release);
+	return fb;
 }
 
 /**
@@ -1380,6 +1883,7 @@ drm_pending_state_get_output(struct drm_pending_state *pending_state,
 }
 
 static int drm_pending_state_apply_sync(struct drm_pending_state *state);
+static int drm_pending_state_test(struct drm_pending_state *state);
 
 /**
  * Mark a drm_output_state (the output's last state) as complete. This handles
@@ -1468,8 +1972,10 @@ drm_output_assign_state(struct drm_output_state *state,
 
 	output->state_cur = state;
 
-	if (b->atomic_modeset && mode == DRM_STATE_APPLY_ASYNC)
+	if (b->atomic_modeset && mode == DRM_STATE_APPLY_ASYNC) {
+		drm_debug(b, "\t[CRTC:%u] setting pending flip\n", output->crtc_id);
 		output->atomic_complete_pending = 1;
+	}
 
 	/* Replace state_cur on each affected plane with the new state, being
 	 * careful to dispose of orphaned (but only orphaned) previous state.
@@ -1497,136 +2003,85 @@ drm_output_assign_state(struct drm_output_state *state,
 	}
 }
 
-static int
-drm_view_transform_supported(struct weston_view *ev)
-{
-	return !ev->transform.enabled ||
-		(ev->transform.matrix.type < WESTON_MATRIX_TRANSFORM_ROTATE);
-}
-
-static uint32_t
-drm_output_check_scanout_format(struct drm_output *output,
-				struct weston_surface *es, struct gbm_bo *bo)
-{
-	uint32_t format;
-	pixman_region32_t r;
-
-	format = gbm_bo_get_format(bo);
-
-	if (format == GBM_FORMAT_ARGB8888) {
-		/* We can scanout an ARGB buffer if the surface's
-		 * opaque region covers the whole output, but we have
-		 * to use XRGB as the KMS format code. */
-		pixman_region32_init_rect(&r, 0, 0,
-					  output->base.width,
-					  output->base.height);
-		pixman_region32_subtract(&r, &r, &es->opaque);
-
-		if (!pixman_region32_not_empty(&r))
-			format = GBM_FORMAT_XRGB8888;
-
-		pixman_region32_fini(&r);
-	}
-
-	if (output->gbm_format == format)
-		return format;
-
-	return 0;
-}
-
-static struct weston_plane *
+static struct drm_plane_state *
 drm_output_prepare_scanout_view(struct drm_output_state *output_state,
-				struct weston_view *ev)
+				struct weston_view *ev,
+				enum drm_output_propose_state_mode mode)
 {
 	struct drm_output *output = output_state->output;
 	struct drm_backend *b = to_drm_backend(output->base.compositor);
 	struct drm_plane *scanout_plane = output->scanout_plane;
 	struct drm_plane_state *state;
-	struct weston_buffer *buffer = ev->surface->buffer_ref.buffer;
-	struct weston_buffer_viewport *viewport = &ev->surface->buffer_viewport;
-	struct gbm_bo *bo;
-	uint32_t format;
+	struct drm_fb *fb;
+	pixman_box32_t *extents;
 
-	/* Don't import buffers which span multiple outputs. */
-	if (ev->output_mask != (1u << output->base.id))
-		return NULL;
+	assert(!b->sprites_are_broken);
+	assert(mode == DRM_OUTPUT_PROPOSE_STATE_PLANES_ONLY);
 
-	/* We use GBM to import buffers. */
-	if (b->gbm == NULL)
-		return NULL;
-
-	if (buffer == NULL)
-		return NULL;
-	if (wl_shm_buffer_get(buffer->resource))
+	/* Check the view spans exactly the output size, calculated in the
+	 * logical co-ordinate space. */
+	extents = pixman_region32_extents(&ev->transform.boundingbox);
+	if (extents->x1 != output->base.x ||
+	    extents->y1 != output->base.y ||
+	    extents->x2 != output->base.x + output->base.width ||
+	    extents->y2 != output->base.y + output->base.height)
 		return NULL;
 
-	/* Make sure our view is exactly compatible with the output. */
-	if (ev->geometry.x != output->base.x ||
-	    ev->geometry.y != output->base.y)
-		return NULL;
-	if (buffer->width != output->base.current_mode->width ||
-	    buffer->height != output->base.current_mode->height)
-		return NULL;
-
-	if (ev->transform.enabled)
-		return NULL;
-	if (ev->geometry.scissor_enabled)
-		return NULL;
-	if (viewport->buffer.transform != output->base.transform)
-		return NULL;
-	if (viewport->buffer.scale != output->base.current_scale)
-		return NULL;
-	if (!drm_view_transform_supported(ev))
+	/* If the surface buffer has an in-fence fd, but the plane doesn't
+	 * support fences, we can't place the buffer on this plane. */
+	if (ev->surface->acquire_fence_fd >= 0 &&
+	    (!b->atomic_modeset ||
+	     scanout_plane->props[WDRM_PLANE_IN_FENCE_FD].prop_id == 0))
 		return NULL;
 
-	if (ev->alpha != 1.0f)
+	fb = drm_fb_get_from_view(output_state, ev);
+	if (!fb) {
+		drm_debug(b, "\t\t\t\t[scanout] not placing view %p on scanout: "
+			     " couldn't get fb\n", ev);
 		return NULL;
+	}
+
+	/* Can't change formats with just a pageflip */
+	if (!b->atomic_modeset && fb->format->format != output->gbm_format) {
+		drm_fb_unref(fb);
+		return NULL;
+	}
 
 	state = drm_output_state_get_plane(output_state, scanout_plane);
-	if (state->fb) {
-		/* If there is already a framebuffer on the scanout plane,
-		 * a client view has already been placed on the scanout
-		 * view. In that case, do not free or put back the state,
-		 * but just leave it in place and quietly exit. */
-		return NULL;
-	}
 
-	bo = gbm_bo_import(b->gbm, GBM_BO_IMPORT_WL_BUFFER,
-			   buffer->resource, GBM_BO_USE_SCANOUT);
-
-	/* Unable to use the buffer for scanout */
-	if (!bo)
-		return NULL;
-
-	format = drm_output_check_scanout_format(output, ev->surface, bo);
-	if (format == 0) {
-		drm_plane_state_put_back(state);
-		gbm_bo_destroy(bo);
-		return NULL;
-	}
-
-	state->fb = drm_fb_get_from_bo(bo, b, format, BUFFER_CLIENT);
-	if (!state->fb) {
-		drm_plane_state_put_back(state);
-		gbm_bo_destroy(bo);
-		return NULL;
-	}
-
-	drm_fb_set_buffer(state->fb, buffer);
-
+	/* The only way we can already have a buffer in the scanout plane is
+	 * if we are in mixed mode, or if a client buffer has already been
+	 * placed into scanout. The former case will never call into here,
+	 * and in the latter case, the view must have been marked as occluded,
+	 * meaning we should never have ended up here. */
+	assert(!state->fb);
+	state->fb = fb;
+	state->ev = ev;
 	state->output = output;
+	if (!drm_plane_state_coords_for_view(state, ev))
+		goto err;
 
-	state->src_x = 0;
-	state->src_y = 0;
-	state->src_w = state->fb->width << 16;
-	state->src_h = state->fb->height << 16;
+	if (state->dest_x != 0 || state->dest_y != 0 ||
+	    state->dest_w != (unsigned) output->base.current_mode->width ||
+	    state->dest_h != (unsigned) output->base.current_mode->height)
+		goto err;
 
-	state->dest_x = 0;
-	state->dest_y = 0;
-	state->dest_w = output->base.current_mode->width;
-	state->dest_h = output->base.current_mode->height;
+	/* The legacy API does not let us perform cropping or scaling. */
+	if (!b->atomic_modeset &&
+	    (state->src_x != 0 || state->src_y != 0 ||
+	     state->src_w != state->dest_w << 16 ||
+	     state->src_h != state->dest_h << 16))
+		goto err;
 
-	return &scanout_plane->base;
+	state->in_fence_fd = ev->surface->acquire_fence_fd;
+
+	/* In plane-only mode, we don't need to test the state now, as we
+	 * will only test it once at the end. */
+	return state;
+
+err:
+	drm_plane_state_put_back(state);
+	return NULL;
 }
 
 static struct drm_fb *
@@ -1646,7 +2101,8 @@ drm_output_render_gl(struct drm_output_state *state, pixman_region32_t *damage)
 		return NULL;
 	}
 
-	ret = drm_fb_get_from_bo(bo, b, output->gbm_format, BUFFER_GBM_SURFACE);
+	/* The renderer always produces an opaque image. */
+	ret = drm_fb_get_from_bo(bo, b, true, BUFFER_GBM_SURFACE);
 	if (!ret) {
 		weston_log("failed to get drm_fb for bo\n");
 		gbm_surface_release_buffer(output->gbm_surface, bo);
@@ -1663,25 +2119,17 @@ drm_output_render_pixman(struct drm_output_state *state,
 {
 	struct drm_output *output = state->output;
 	struct weston_compositor *ec = output->base.compositor;
-	pixman_region32_t total_damage, previous_damage;
-
-	pixman_region32_init(&total_damage);
-	pixman_region32_init(&previous_damage);
-
-	pixman_region32_copy(&previous_damage, damage);
-
-	pixman_region32_union(&total_damage, damage, &output->previous_damage);
-	pixman_region32_copy(&output->previous_damage, &previous_damage);
 
 	output->current_image ^= 1;
 
 	pixman_renderer_output_set_buffer(&output->base,
 					  output->image[output->current_image]);
+	pixman_renderer_output_set_hw_extra_damage(&output->base,
+						   &output->previous_damage);
 
-	ec->renderer->repaint_output(&output->base, &total_damage);
+	ec->renderer->repaint_output(&output->base, damage);
 
-	pixman_region32_fini(&total_damage);
-	pixman_region32_fini(&previous_damage);
+	pixman_region32_copy(&output->previous_damage, damage);
 
 	return drm_fb_ref(output->dumb[output->current_image]);
 }
@@ -1792,14 +2240,21 @@ drm_output_apply_state_legacy(struct drm_output_state *state)
 	struct drm_output *output = state->output;
 	struct drm_backend *backend = to_drm_backend(output->base.compositor);
 	struct drm_plane *scanout_plane = output->scanout_plane;
-	struct drm_property_info *dpms_prop =
-		&output->props_conn[WDRM_CONNECTOR_DPMS];
+	struct drm_property_info *dpms_prop;
 	struct drm_plane_state *scanout_state;
 	struct drm_plane_state *ps;
-	struct drm_plane *p;
 	struct drm_mode *mode;
+	struct drm_head *head;
+	const struct pixel_format_info *pinfo = NULL;
+	uint32_t connectors[MAX_CLONED_CONNECTORS];
+	int n_conn = 0;
 	struct timespec now;
 	int ret = 0;
+
+	wl_list_for_each(head, &output->base.head_list, base.output_link) {
+		assert(n_conn < MAX_CLONED_CONNECTORS);
+		connectors[n_conn++] = head->connector_id;
+	}
 
 	/* If disable_planes is set then assign_planes() wasn't
 	 * called for this render, so we could still have a stale
@@ -1815,7 +2270,7 @@ drm_output_apply_state_legacy(struct drm_output_state *state)
 
 	if (state->dpms != WESTON_DPMS_ON) {
 		wl_list_for_each(ps, &state->plane_list, link) {
-			p = ps->plane;
+			struct drm_plane *p = ps->plane;
 			assert(ps->fb == NULL);
 			assert(ps->output == NULL);
 
@@ -1836,7 +2291,7 @@ drm_output_apply_state_legacy(struct drm_output_state *state)
 		}
 
 		ret = drmModeSetCrtc(backend->drm.fd, output->crtc_id, 0, 0, 0,
-				     &output->connector_id, 0, NULL);
+				     NULL, 0, NULL);
 		if (ret)
 			weston_log("drmModeSetCrtc failed disabling: %m\n");
 
@@ -1864,20 +2319,30 @@ drm_output_apply_state_legacy(struct drm_output_state *state)
 	assert(scanout_state->dest_y == 0);
 	assert(scanout_state->dest_w == scanout_state->src_w >> 16);
 	assert(scanout_state->dest_h == scanout_state->src_h >> 16);
+	/* The legacy SetCrtc API doesn't support fences */
+	assert(scanout_state->in_fence_fd == -1);
 
 	mode = to_drm_mode(output->base.current_mode);
-	if (backend->state_invalid || !scanout_plane->state_cur->fb ||
-	    scanout_plane->state_cur->fb->stride != scanout_state->fb->stride) {
+	if (backend->state_invalid ||
+	    !scanout_plane->state_cur->fb ||
+	    scanout_plane->state_cur->fb->strides[0] !=
+	    scanout_state->fb->strides[0]) {
+
 		ret = drmModeSetCrtc(backend->drm.fd, output->crtc_id,
 				     scanout_state->fb->fb_id,
 				     0, 0,
-				     &output->connector_id, 1,
+				     connectors, n_conn,
 				     &mode->mode_info);
 		if (ret) {
 			weston_log("set mode failed: %m\n");
 			goto err;
 		}
 	}
+
+	pinfo = scanout_state->fb->format;
+	drm_debug(backend, "\t[CRTC:%u, PLANE:%u] FORMAT: %s\n",
+			   output->crtc_id, scanout_state->plane->plane_id,
+			   pinfo ? pinfo->drm_format_name : "UNKNOWN");
 
 	if (drmModePageFlip(backend->drm.fd, output->crtc_id,
 			    scanout_state->fb->fb_id,
@@ -1903,8 +2368,8 @@ drm_output_apply_state_legacy(struct drm_output_state *state)
 			.request.type = DRM_VBLANK_RELATIVE | DRM_VBLANK_EVENT,
 			.request.sequence = 1,
 		};
+		struct drm_plane *p = ps->plane;
 
-		p = ps->plane;
 		if (p->type != WDRM_PLANE_TYPE_OVERLAY)
 			continue;
 
@@ -1914,6 +2379,8 @@ drm_output_apply_state_legacy(struct drm_output_state *state)
 		assert(!ps->complete);
 		assert(!ps->output || ps->output == output);
 		assert(!!ps->output == !!ps->fb);
+		/* The legacy SetPlane API doesn't support fences */
+		assert(ps->in_fence_fd == -1);
 
 		if (ps->fb && !backend->sprites_hidden)
 			fb_id = ps->fb->fb_id;
@@ -1942,14 +2409,20 @@ drm_output_apply_state_legacy(struct drm_output_state *state)
 		}
 	}
 
-	if (dpms_prop->prop_id && state->dpms != output->state_cur->dpms) {
-		ret = drmModeConnectorSetProperty(backend->drm.fd,
-						  output->connector_id,
-						  dpms_prop->prop_id,
-						  state->dpms);
-		if (ret) {
-			weston_log("DRM: DPMS: failed property set for %s\n",
-				   output->base.name);
+	if (state->dpms != output->state_cur->dpms) {
+		wl_list_for_each(head, &output->base.head_list, base.output_link) {
+			dpms_prop = &head->props_conn[WDRM_CONNECTOR_DPMS];
+			if (dpms_prop->prop_id == 0)
+				continue;
+
+			ret = drmModeConnectorSetProperty(backend->drm.fd,
+							  head->connector_id,
+							  dpms_prop->prop_id,
+							  state->dpms);
+			if (ret) {
+				weston_log("DRM: DPMS: failed property set for %s\n",
+					   head->base.name);
+			}
 		}
 	}
 
@@ -1976,21 +2449,29 @@ crtc_add_prop(drmModeAtomicReq *req, struct drm_output *output,
 
 	ret = drmModeAtomicAddProperty(req, output->crtc_id, info->prop_id,
 				       val);
+	drm_debug(output->backend, "\t\t\t[CRTC:%lu] %lu (%s) -> %llu (0x%llx)\n",
+		  (unsigned long) output->crtc_id,
+		  (unsigned long) info->prop_id, info->name,
+		  (unsigned long long) val, (unsigned long long) val);
 	return (ret <= 0) ? -1 : 0;
 }
 
 static int
-connector_add_prop(drmModeAtomicReq *req, struct drm_output *output,
+connector_add_prop(drmModeAtomicReq *req, struct drm_head *head,
 		   enum wdrm_connector_property prop, uint64_t val)
 {
-	struct drm_property_info *info = &output->props_conn[prop];
+	struct drm_property_info *info = &head->props_conn[prop];
 	int ret;
 
 	if (info->prop_id == 0)
 		return -1;
 
-	ret = drmModeAtomicAddProperty(req, output->connector_id,
+	ret = drmModeAtomicAddProperty(req, head->connector_id,
 				       info->prop_id, val);
+	drm_debug(head->backend, "\t\t\t[CONN:%lu] %lu (%s) -> %llu (0x%llx)\n",
+		  (unsigned long) head->connector_id,
+		  (unsigned long) info->prop_id, info->name,
+		  (unsigned long long) val, (unsigned long long) val);
 	return (ret <= 0) ? -1 : 0;
 }
 
@@ -2006,6 +2487,10 @@ plane_add_prop(drmModeAtomicReq *req, struct drm_plane *plane,
 
 	ret = drmModeAtomicAddProperty(req, plane->plane_id, info->prop_id,
 				       val);
+	drm_debug(plane->backend, "\t\t\t[PLANE:%lu] %lu (%s) -> %llu (0x%llx)\n",
+		  (unsigned long) plane->plane_id,
+		  (unsigned long) info->prop_id, info->name,
+		  (unsigned long long) val, (unsigned long long) val);
 	return (ret <= 0) ? -1 : 0;
 }
 
@@ -2024,6 +2509,9 @@ drm_mode_ensure_blob(struct drm_backend *backend, struct drm_mode *mode)
 	if (ret != 0)
 		weston_log("failed to create mode property blob: %m\n");
 
+	drm_debug(backend, "\t\t\t[atomic] created new mode blob %lu for %s\n",
+		  (unsigned long) mode->blob_id, mode->mode_info.name);
+
 	return ret;
 }
 
@@ -2033,29 +2521,44 @@ drm_output_apply_state_atomic(struct drm_output_state *state,
 			      uint32_t *flags)
 {
 	struct drm_output *output = state->output;
-	struct drm_backend *backend = to_drm_backend(output->base.compositor);
+	struct drm_backend *b = to_drm_backend(output->base.compositor);
 	struct drm_plane_state *plane_state;
 	struct drm_mode *current_mode = to_drm_mode(output->base.current_mode);
+	struct drm_head *head;
 	int ret = 0;
 
-	if (state->dpms != output->state_cur->dpms)
+	drm_debug(b, "\t\t[atomic] %s output %lu (%s) state\n",
+		  (*flags & DRM_MODE_ATOMIC_TEST_ONLY) ? "testing" : "applying",
+		  (unsigned long) output->base.id, output->base.name);
+
+	if (state->dpms != output->state_cur->dpms) {
+		drm_debug(b, "\t\t\t[atomic] DPMS state differs, modeset OK\n");
 		*flags |= DRM_MODE_ATOMIC_ALLOW_MODESET;
+	}
 
 	if (state->dpms == WESTON_DPMS_ON) {
-		ret = drm_mode_ensure_blob(backend, current_mode);
+		ret = drm_mode_ensure_blob(b, current_mode);
 		if (ret != 0)
 			return ret;
 
 		ret |= crtc_add_prop(req, output, WDRM_CRTC_MODE_ID,
 				     current_mode->blob_id);
 		ret |= crtc_add_prop(req, output, WDRM_CRTC_ACTIVE, 1);
-		ret |= connector_add_prop(req, output, WDRM_CONNECTOR_CRTC_ID,
-					  output->crtc_id);
+
+		/* No need for the DPMS property, since it is implicit in
+		 * routing and CRTC activity. */
+		wl_list_for_each(head, &output->base.head_list, base.output_link) {
+			ret |= connector_add_prop(req, head, WDRM_CONNECTOR_CRTC_ID,
+						  output->crtc_id);
+		}
 	} else {
 		ret |= crtc_add_prop(req, output, WDRM_CRTC_MODE_ID, 0);
 		ret |= crtc_add_prop(req, output, WDRM_CRTC_ACTIVE, 0);
-		ret |= connector_add_prop(req, output, WDRM_CONNECTOR_CRTC_ID,
-					  0);
+
+		/* No need for the DPMS property, since it is implicit in
+		 * routing and CRTC activity. */
+		wl_list_for_each(head, &output->base.head_list, base.output_link)
+			ret |= connector_add_prop(req, head, WDRM_CONNECTOR_CRTC_ID, 0);
 	}
 
 	if (ret != 0) {
@@ -2065,6 +2568,7 @@ drm_output_apply_state_atomic(struct drm_output_state *state,
 
 	wl_list_for_each(plane_state, &state->plane_list, link) {
 		struct drm_plane *plane = plane_state->plane;
+		const struct pixel_format_info *pinfo = NULL;
 
 		ret |= plane_add_prop(req, plane, WDRM_PLANE_FB_ID,
 				      plane_state->fb ? plane_state->fb->fb_id : 0);
@@ -2087,6 +2591,19 @@ drm_output_apply_state_atomic(struct drm_output_state *state,
 		ret |= plane_add_prop(req, plane, WDRM_PLANE_CRTC_H,
 				      plane_state->dest_h);
 
+		if (plane_state->fb && plane_state->fb->format)
+			pinfo = plane_state->fb->format;
+
+		drm_debug(plane->backend, "\t\t\t[PLANE:%lu] FORMAT: %s\n",
+				(unsigned long) plane->plane_id,
+				pinfo ? pinfo->drm_format_name : "UNKNOWN");
+
+		if (plane_state->in_fence_fd >= 0) {
+			ret |= plane_add_prop(req, plane,
+					      WDRM_PLANE_IN_FENCE_FD,
+					      plane_state->in_fence_fd);
+		}
+
 		if (ret != 0) {
 			weston_log("couldn't set plane state\n");
 			return ret;
@@ -2108,54 +2625,57 @@ drm_pending_state_apply_atomic(struct drm_pending_state *pending_state,
 	struct drm_output_state *output_state, *tmp;
 	struct drm_plane *plane;
 	drmModeAtomicReq *req = drmModeAtomicAlloc();
-	uint32_t flags = 0;
+	uint32_t flags;
 	int ret = 0;
 
 	if (!req)
 		return -1;
 
+	switch (mode) {
+	case DRM_STATE_APPLY_SYNC:
+		flags = 0;
+		break;
+	case DRM_STATE_APPLY_ASYNC:
+		flags = DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_ATOMIC_NONBLOCK;
+		break;
+	case DRM_STATE_TEST_ONLY:
+		flags = DRM_MODE_ATOMIC_TEST_ONLY;
+		break;
+	}
+
 	if (b->state_invalid) {
+		struct weston_head *head_base;
+		struct drm_head *head;
 		uint32_t *unused;
 		int err;
+
+		drm_debug(b, "\t\t[atomic] previous state invalid; "
+			     "starting with fresh state\n");
 
 		/* If we need to reset all our state (e.g. because we've
 		 * just started, or just been VT-switched in), explicitly
 		 * disable all the CRTCs and connectors we aren't using. */
-		wl_array_for_each(unused, &b->unused_connectors) {
-			struct drm_property_info infos[WDRM_CONNECTOR__COUNT];
+		wl_list_for_each(head_base,
+				 &b->compositor->head_list, compositor_link) {
 			struct drm_property_info *info;
-			drmModeObjectProperties *props;
 
-			memset(infos, 0, sizeof(infos));
-
-			props = drmModeObjectGetProperties(b->drm.fd,
-							   *unused,
-							   DRM_MODE_OBJECT_CONNECTOR);
-			if (!props) {
-				ret = -1;
+			if (weston_head_is_enabled(head_base))
 				continue;
-			}
 
-			drm_property_info_populate(b, connector_props, infos,
-						   WDRM_CONNECTOR__COUNT,
-						   props);
-			drmModeFreeObjectProperties(props);
+			head = to_drm_head(head_base);
 
-			info = &infos[WDRM_CONNECTOR_CRTC_ID];
-			err = drmModeAtomicAddProperty(req, *unused,
+			drm_debug(b, "\t\t[atomic] disabling inactive head %s\n",
+				  head_base->name);
+
+			info = &head->props_conn[WDRM_CONNECTOR_CRTC_ID];
+			err = drmModeAtomicAddProperty(req, head->connector_id,
 						       info->prop_id, 0);
+			drm_debug(b, "\t\t\t[CONN:%lu] %lu (%s) -> 0\n",
+				  (unsigned long) head->connector_id,
+				  (unsigned long) info->prop_id,
+				  info->name);
 			if (err <= 0)
 				ret = -1;
-
-			info = &infos[WDRM_CONNECTOR_DPMS];
-			if (info->prop_id > 0)
-				err = drmModeAtomicAddProperty(req, *unused,
-							       info->prop_id,
-							       DRM_MODE_DPMS_OFF);
-			if (err <= 0)
-				ret = -1;
-
-			drm_property_info_free(infos, WDRM_CONNECTOR__COUNT);
 		}
 
 		wl_array_for_each(unused, &b->unused_crtcs) {
@@ -2190,12 +2710,21 @@ drm_pending_state_apply_atomic(struct drm_pending_state *pending_state,
 				continue;
 			}
 
+			drm_debug(b, "\t\t[atomic] disabling unused CRTC %lu\n",
+				  (unsigned long) *unused);
+
+			drm_debug(b, "\t\t\t[CRTC:%lu] %lu (%s) -> 0\n",
+				  (unsigned long) *unused,
+				  (unsigned long) info->prop_id, info->name);
 			err = drmModeAtomicAddProperty(req, *unused,
 						       info->prop_id, 0);
 			if (err <= 0)
 				ret = -1;
 
 			info = &infos[WDRM_CRTC_MODE_ID];
+			drm_debug(b, "\t\t\t[CRTC:%lu] %lu (%s) -> 0\n",
+				  (unsigned long) *unused,
+				  (unsigned long) info->prop_id, info->name);
 			err = drmModeAtomicAddProperty(req, *unused,
 						       info->prop_id, 0);
 			if (err <= 0)
@@ -2207,6 +2736,8 @@ drm_pending_state_apply_atomic(struct drm_pending_state *pending_state,
 		/* Disable all the planes; planes which are being used will
 		 * override this state in the output-state application. */
 		wl_list_for_each(plane, &b->plane_list, link) {
+			drm_debug(b, "\t\t[atomic] starting with plane %lu disabled\n",
+				  (unsigned long) plane->plane_id);
 			plane_add_prop(req, plane, WDRM_PLANE_CRTC_ID, 0);
 			plane_add_prop(req, plane, WDRM_PLANE_FB_ID, 0);
 		}
@@ -2215,6 +2746,8 @@ drm_pending_state_apply_atomic(struct drm_pending_state *pending_state,
 	}
 
 	wl_list_for_each(output_state, &pending_state->output_list, link) {
+		if (output_state->output->virtual)
+			continue;
 		if (mode == DRM_STATE_APPLY_SYNC)
 			assert(output_state->dpms == WESTON_DPMS_OFF);
 		ret |= drm_output_apply_state_atomic(output_state, req, &flags);
@@ -2225,15 +2758,16 @@ drm_pending_state_apply_atomic(struct drm_pending_state *pending_state,
 		goto out;
 	}
 
-	switch (mode) {
-	case DRM_STATE_APPLY_SYNC:
-		break;
-	case DRM_STATE_APPLY_ASYNC:
-		flags |= DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_ATOMIC_NONBLOCK;
-		break;
+	ret = drmModeAtomicCommit(b->drm.fd, req, flags, b);
+	drm_debug(b, "[atomic] drmModeAtomicCommit\n");
+
+	/* Test commits do not take ownership of the state; return
+	 * without freeing here. */
+	if (mode == DRM_STATE_TEST_ONLY) {
+		drmModeAtomicFree(req);
+		return ret;
 	}
 
-	ret = drmModeAtomicCommit(b->drm.fd, req, flags, b);
 	if (ret != 0) {
 		weston_log("atomic: couldn't commit new state: %m\n");
 		goto out;
@@ -2253,6 +2787,40 @@ out:
 	return ret;
 }
 #endif
+
+/**
+ * Tests a pending state, to see if the kernel will accept the update as
+ * constructed.
+ *
+ * Using atomic modesetting, the kernel performs the same checks as it would
+ * on a real commit, returning success or failure without actually modifying
+ * the running state. It does not return -EBUSY if there are pending updates
+ * in flight, so states may be tested at any point, however this means a
+ * state which passed testing may fail on a real commit if the timing is not
+ * respected (e.g. committing before the previous commit has completed).
+ *
+ * Without atomic modesetting, we have no way to check, so we optimistically
+ * claim it will work.
+ *
+ * Unlike drm_pending_state_apply() and drm_pending_state_apply_sync(), this
+ * function does _not_ take ownership of pending_state, nor does it clear
+ * state_invalid.
+ */
+static int
+drm_pending_state_test(struct drm_pending_state *pending_state)
+{
+#ifdef HAVE_DRM_ATOMIC
+	struct drm_backend *b = pending_state->backend;
+
+	if (b->atomic_modeset)
+		return drm_pending_state_apply_atomic(pending_state,
+						      DRM_STATE_TEST_ONLY);
+#endif
+
+	/* We have no way to test state before application on the legacy
+	 * modesetting API, so just claim it succeeded. */
+	return 0;
+}
 
 /**
  * Applies all of a pending_state asynchronously: the primary entry point for
@@ -2289,6 +2857,12 @@ drm_pending_state_apply(struct drm_pending_state *pending_state)
 			      link) {
 		struct drm_output *output = output_state->output;
 		int ret;
+
+		if (output->virtual) {
+			drm_output_assign_state(output_state,
+						DRM_STATE_APPLY_ASYNC);
+			continue;
+		}
 
 		ret = drm_output_apply_state_legacy(output_state);
 		if (ret != 0) {
@@ -2367,6 +2941,8 @@ drm_output_repaint(struct weston_output *output_base,
 	struct drm_output *output = to_drm_output(output_base);
 	struct drm_output_state *state = NULL;
 	struct drm_plane_state *scanout_state;
+
+	assert(!output->virtual);
 
 	if (output->disable_pending || output->destroy_pending)
 		goto err;
@@ -2555,6 +3131,14 @@ drm_repaint_begin(struct weston_compositor *compositor)
 	ret = drm_pending_state_alloc(b);
 	b->repaint_data = ret;
 
+	if (weston_debug_scope_is_enabled(b->debug)) {
+		char *dbg = weston_compositor_print_scene_graph(compositor);
+		drm_debug(b, "[repaint] Beginning repaint; pending_state %p\n",
+			  ret);
+		drm_debug(b, "%s", dbg);
+		free(dbg);
+	}
+
 	return ret;
 }
 
@@ -2574,6 +3158,7 @@ drm_repaint_flush(struct weston_compositor *compositor, void *repaint_data)
 	struct drm_pending_state *pending_state = repaint_data;
 
 	drm_pending_state_apply(pending_state);
+	drm_debug(b, "[repaint] flushed pending_state %p\n", pending_state);
 	b->repaint_data = NULL;
 }
 
@@ -2590,6 +3175,7 @@ drm_repaint_cancel(struct weston_compositor *compositor, void *repaint_data)
 	struct drm_pending_state *pending_state = repaint_data;
 
 	drm_pending_state_free(pending_state);
+	drm_debug(b, "[repaint] cancel pending_state %p\n", pending_state);
 	b->repaint_data = NULL;
 }
 
@@ -2612,87 +3198,44 @@ atomic_flip_handler(int fd, unsigned int frame, unsigned int sec,
 
 	drm_output_update_msc(output, frame);
 
+	drm_debug(b, "[atomic][CRTC:%u] flip processing started\n", crtc_id);
 	assert(b->atomic_modeset);
 	assert(output->atomic_complete_pending);
 	output->atomic_complete_pending = 0;
 
 	drm_output_update_complete(output, flags, sec, usec);
+	drm_debug(b, "[atomic][CRTC:%u] flip processing completed\n", crtc_id);
 }
 #endif
 
-static uint32_t
-drm_output_check_plane_format(struct drm_plane *p,
-			       struct weston_view *ev, struct gbm_bo *bo)
-{
-	uint32_t i, format;
-
-	format = gbm_bo_get_format(bo);
-
-	if (format == GBM_FORMAT_ARGB8888) {
-		pixman_region32_t r;
-
-		pixman_region32_init_rect(&r, 0, 0,
-					  ev->surface->width,
-					  ev->surface->height);
-		pixman_region32_subtract(&r, &r, &ev->surface->opaque);
-
-		if (!pixman_region32_not_empty(&r))
-			format = GBM_FORMAT_XRGB8888;
-
-		pixman_region32_fini(&r);
-	}
-
-	for (i = 0; i < p->count_formats; i++)
-		if (p->formats[i] == format)
-			return format;
-
-	return 0;
-}
-
-static struct weston_plane *
+static struct drm_plane_state *
 drm_output_prepare_overlay_view(struct drm_output_state *output_state,
-				struct weston_view *ev)
+				struct weston_view *ev,
+				enum drm_output_propose_state_mode mode)
 {
 	struct drm_output *output = output_state->output;
 	struct weston_compositor *ec = output->base.compositor;
 	struct drm_backend *b = to_drm_backend(ec);
-	struct weston_buffer_viewport *viewport = &ev->surface->buffer_viewport;
-	struct wl_resource *buffer_resource;
 	struct drm_plane *p;
 	struct drm_plane_state *state = NULL;
-	struct linux_dmabuf_buffer *dmabuf;
-	struct gbm_bo *bo;
-	pixman_region32_t dest_rect, src_rect;
-	pixman_box32_t *box, tbox;
-	uint32_t format;
-	wl_fixed_t sx1, sy1, sx2, sy2;
+	struct drm_fb *fb;
+	unsigned int i;
+	int ret;
+	enum {
+		NO_PLANES,
+		NO_PLANES_WITH_FORMAT,
+		NO_PLANES_ACCEPTED,
+		PLACED_ON_PLANE,
+	} availability = NO_PLANES;
 
-	if (b->sprites_are_broken)
-		return NULL;
+	assert(!b->sprites_are_broken);
 
-	/* Don't import buffers which span multiple outputs. */
-	if (ev->output_mask != (1u << output->base.id))
+	fb = drm_fb_get_from_view(output_state, ev);
+	if (!fb) {
+		drm_debug(b, "\t\t\t\t[overlay] not placing view %p on overlay: "
+			     " couldn't get fb\n", ev);
 		return NULL;
-
-	/* We can only import GBM buffers. */
-	if (b->gbm == NULL)
-		return NULL;
-
-	if (ev->surface->buffer_ref.buffer == NULL)
-		return NULL;
-	buffer_resource = ev->surface->buffer_ref.buffer->resource;
-	if (wl_shm_buffer_get(buffer_resource))
-		return NULL;
-
-	if (viewport->buffer.transform != output->base.transform)
-		return NULL;
-	if (viewport->buffer.scale != output->base.current_scale)
-		return NULL;
-	if (!drm_view_transform_supported(ev))
-		return NULL;
-
-	if (ev->alpha != 1.0f)
-		return NULL;
+	}
 
 	wl_list_for_each(p, &b->plane_list, link) {
 		if (p->type != WDRM_PLANE_TYPE_OVERLAY)
@@ -2707,153 +3250,136 @@ drm_output_prepare_overlay_view(struct drm_output_state *output_state,
 			continue;
 		}
 
+		if (availability == NO_PLANES)
+			availability = NO_PLANES_WITH_FORMAT;
+
+		/* Check whether the format is supported */
+		for (i = 0; i < p->count_formats; i++) {
+			unsigned int j;
+
+			if (p->formats[i].format != fb->format->format)
+				continue;
+
+			if (fb->modifier == DRM_FORMAT_MOD_INVALID)
+				break;
+
+			for (j = 0; j < p->formats[i].count_modifiers; j++) {
+				if (p->formats[i].modifiers[j] == fb->modifier)
+					break;
+			}
+			if (j != p->formats[i].count_modifiers)
+				break;
+		}
+		if (i == p->count_formats) {
+			drm_plane_state_put_back(state);
+			state = NULL;
+			continue;
+		}
+
+		if (availability == NO_PLANES_WITH_FORMAT)
+			availability = NO_PLANES_ACCEPTED;
+
+		state->ev = ev;
+		state->output = output;
+		if (!drm_plane_state_coords_for_view(state, ev)) {
+			drm_debug(b, "\t\t\t\t[overlay] not placing view %p on overlay: "
+				     "unsuitable transform\n", ev);
+			drm_plane_state_put_back(state);
+			state = NULL;
+			continue;
+		}
+		if (!b->atomic_modeset &&
+		    (state->src_w != state->dest_w << 16 ||
+		     state->src_h != state->dest_h << 16)) {
+			drm_debug(b, "\t\t\t\t[overlay] not placing view %p on overlay: "
+				     "no scaling without atomic\n", ev);
+			drm_plane_state_put_back(state);
+			state = NULL;
+			continue;
+		}
+
+		/* If the surface buffer has an in-fence fd, but the plane
+		 * doesn't support fences, we can't place the buffer on this
+		 * plane. */
+		if (ev->surface->acquire_fence_fd >= 0 &&
+		    (!b->atomic_modeset ||
+		     p->props[WDRM_PLANE_IN_FENCE_FD].prop_id == 0)) {
+			drm_debug(b, "\t\t\t\t[overlay] not placing view %p on overlay: "
+				     "no in-fence support\n", ev);
+			drm_plane_state_put_back(state);
+			state = NULL;
+			continue;
+		}
+
+		/* We hold one reference for the lifetime of this function;
+		 * from calling drm_fb_get_from_view, to the out label where
+		 * we unconditionally drop the reference. So, we take another
+		 * reference here to live within the state. */
+		state->fb = drm_fb_ref(fb);
+
+		state->in_fence_fd = ev->surface->acquire_fence_fd;
+
+		/* In planes-only mode, we don't have an incremental state to
+		 * test against, so we just hope it'll work. */
+		if (mode == DRM_OUTPUT_PROPOSE_STATE_PLANES_ONLY) {
+			drm_debug(b, "\t\t\t\t[overlay] provisionally placing "
+				     "view %p on overlay %lu in planes-only mode\n",
+				  ev, (unsigned long) p->plane_id);
+			availability = PLACED_ON_PLANE;
+			goto out;
+		}
+
+		ret = drm_pending_state_test(output_state->pending_state);
+		if (ret == 0) {
+			drm_debug(b, "\t\t\t\t[overlay] provisionally placing "
+				     "view %p on overlay %d in mixed mode\n",
+				  ev, p->plane_id);
+			availability = PLACED_ON_PLANE;
+			goto out;
+		}
+
+		drm_debug(b, "\t\t\t\t[overlay] not placing view %p on overlay %lu "
+			     "in mixed mode: kernel test failed\n",
+			  ev, (unsigned long) p->plane_id);
+
+		drm_plane_state_put_back(state);
+		state = NULL;
+	}
+
+	switch (availability) {
+	case NO_PLANES:
+		drm_debug(b, "\t\t\t\t[overlay] not placing view %p on overlay: "
+			     "no free overlay planes\n", ev);
+		break;
+	case NO_PLANES_WITH_FORMAT:
+		drm_debug(b, "\t\t\t\t[overlay] not placing view %p on overlay: "
+			     "no free overlay planes matching format %s (0x%lx) "
+			     "modifier 0x%llx\n",
+			  ev, fb->format->drm_format_name,
+			  (unsigned long) fb->format,
+			  (unsigned long long) fb->modifier);
+		break;
+	case NO_PLANES_ACCEPTED:
+	case PLACED_ON_PLANE:
 		break;
 	}
 
-	/* No sprites available */
-	if (!state)
-		return NULL;
-
-	if ((dmabuf = linux_dmabuf_buffer_get(buffer_resource))) {
-#ifdef HAVE_GBM_FD_IMPORT
-		/* XXX: TODO:
-		 *
-		 * Use AddFB2 directly, do not go via GBM.
-		 * Add support for multiplanar formats.
-		 * Both require refactoring in the DRM-backend to
-		 * support a mix of gbm_bos and drmfbs.
-		 */
-		struct gbm_import_fd_data gbm_dmabuf = {
-			.fd     = dmabuf->attributes.fd[0],
-			.width  = dmabuf->attributes.width,
-			.height = dmabuf->attributes.height,
-			.stride = dmabuf->attributes.stride[0],
-			.format = dmabuf->attributes.format
-		};
-
-                /* XXX: TODO:
-                 *
-                 * Currently the buffer is rejected if any dmabuf attribute
-                 * flag is set.  This keeps us from passing an inverted /
-                 * interlaced / bottom-first buffer (or any other type that may
-                 * be added in the future) through to an overlay.  Ultimately,
-                 * these types of buffers should be handled through buffer
-                 * transforms and not as spot-checks requiring specific
-                 * knowledge. */
-		if (dmabuf->attributes.n_planes != 1 ||
-                    dmabuf->attributes.offset[0] != 0 ||
-		    dmabuf->attributes.flags)
-			return NULL;
-
-		bo = gbm_bo_import(b->gbm, GBM_BO_IMPORT_FD, &gbm_dmabuf,
-				   GBM_BO_USE_SCANOUT);
-#else
-		goto err;
-#endif
-	} else {
-		bo = gbm_bo_import(b->gbm, GBM_BO_IMPORT_WL_BUFFER,
-				   buffer_resource, GBM_BO_USE_SCANOUT);
-	}
-	if (!bo)
-		goto err;
-
-	format = drm_output_check_plane_format(p, ev, bo);
-	if (format == 0)
-		goto err;
-
-	state->fb = drm_fb_get_from_bo(bo, b, format, BUFFER_CLIENT);
-	if (!state->fb)
-		goto err;
-
-	drm_fb_set_buffer(state->fb, ev->surface->buffer_ref.buffer);
-
-	state->output = output;
-
-	box = pixman_region32_extents(&ev->transform.boundingbox);
-	p->base.x = box->x1;
-	p->base.y = box->y1;
-
-	/*
-	 * Calculate the source & dest rects properly based on actual
-	 * position (note the caller has called weston_view_update_transform()
-	 * for us already).
-	 */
-	pixman_region32_init(&dest_rect);
-	pixman_region32_intersect(&dest_rect, &ev->transform.boundingbox,
-				  &output->base.region);
-	pixman_region32_translate(&dest_rect, -output->base.x, -output->base.y);
-	box = pixman_region32_extents(&dest_rect);
-	tbox = weston_transformed_rect(output->base.width,
-				       output->base.height,
-				       output->base.transform,
-				       output->base.current_scale,
-				       *box);
-	state->dest_x = tbox.x1;
-	state->dest_y = tbox.y1;
-	state->dest_w = tbox.x2 - tbox.x1;
-	state->dest_h = tbox.y2 - tbox.y1;
-	pixman_region32_fini(&dest_rect);
-
-	pixman_region32_init(&src_rect);
-	pixman_region32_intersect(&src_rect, &ev->transform.boundingbox,
-				  &output->base.region);
-	box = pixman_region32_extents(&src_rect);
-
-	weston_view_from_global_fixed(ev,
-				      wl_fixed_from_int(box->x1),
-				      wl_fixed_from_int(box->y1),
-				      &sx1, &sy1);
-	weston_view_from_global_fixed(ev,
-				      wl_fixed_from_int(box->x2),
-				      wl_fixed_from_int(box->y2),
-				      &sx2, &sy2);
-
-	if (sx1 < 0)
-		sx1 = 0;
-	if (sy1 < 0)
-		sy1 = 0;
-	if (sx2 > wl_fixed_from_int(ev->surface->width))
-		sx2 = wl_fixed_from_int(ev->surface->width);
-	if (sy2 > wl_fixed_from_int(ev->surface->height))
-		sy2 = wl_fixed_from_int(ev->surface->height);
-
-	tbox.x1 = sx1;
-	tbox.y1 = sy1;
-	tbox.x2 = sx2;
-	tbox.y2 = sy2;
-
-	tbox = weston_transformed_rect(wl_fixed_from_int(ev->surface->width),
-				       wl_fixed_from_int(ev->surface->height),
-				       viewport->buffer.transform,
-				       viewport->buffer.scale,
-				       tbox);
-
-	state->src_x = tbox.x1 << 8;
-	state->src_y = tbox.y1 << 8;
-	state->src_w = (tbox.x2 - tbox.x1) << 8;
-	state->src_h = (tbox.y2 - tbox.y1) << 8;
-	pixman_region32_fini(&src_rect);
-
-	return &p->base;
-
-err:
-	drm_plane_state_put_back(state);
-	if (bo)
-		gbm_bo_destroy(bo);
-	return NULL;
+out:
+	drm_fb_unref(fb);
+	return state;
 }
 
 /**
  * Update the image for the current cursor surface
  *
- * @param b DRM backend structure
- * @param bo GBM buffer object to write into
- * @param ev View to use for cursor image
+ * @param plane_state DRM cursor plane state
+ * @param ev Source view for cursor
  */
 static void
-cursor_bo_update(struct drm_backend *b, struct gbm_bo *bo,
-		 struct weston_view *ev)
+cursor_bo_update(struct drm_plane_state *plane_state, struct weston_view *ev)
 {
+	struct drm_backend *b = plane_state->plane->backend;
+	struct gbm_bo *bo = plane_state->fb->bo;
 	struct weston_buffer *buffer = ev->surface->buffer_ref.buffer;
 	uint32_t buf[b->cursor_width * b->cursor_height];
 	int32_t stride;
@@ -2862,25 +3388,25 @@ cursor_bo_update(struct drm_backend *b, struct gbm_bo *bo,
 
 	assert(buffer && buffer->shm_buffer);
 	assert(buffer->shm_buffer == wl_shm_buffer_get(buffer->resource));
-	assert(ev->surface->width <= b->cursor_width);
-	assert(ev->surface->height <= b->cursor_height);
+	assert(buffer->width <= b->cursor_width);
+	assert(buffer->height <= b->cursor_height);
 
 	memset(buf, 0, sizeof buf);
 	stride = wl_shm_buffer_get_stride(buffer->shm_buffer);
 	s = wl_shm_buffer_get_data(buffer->shm_buffer);
 
 	wl_shm_buffer_begin_access(buffer->shm_buffer);
-	for (i = 0; i < ev->surface->height; i++)
+	for (i = 0; i < buffer->height; i++)
 		memcpy(buf + i * b->cursor_width,
 		       s + i * stride,
-		       ev->surface->width * 4);
+		       buffer->width * 4);
 	wl_shm_buffer_end_access(buffer->shm_buffer);
 
 	if (gbm_bo_write(bo, buf, sizeof buf) < 0)
 		weston_log("failed update cursor: %m\n");
 }
 
-static struct weston_plane *
+static struct drm_plane_state *
 drm_output_prepare_cursor_view(struct drm_output_state *output_state,
 			       struct weston_view *ev)
 {
@@ -2888,15 +3414,12 @@ drm_output_prepare_cursor_view(struct drm_output_state *output_state,
 	struct drm_backend *b = to_drm_backend(output->base.compositor);
 	struct drm_plane *plane = output->cursor_plane;
 	struct drm_plane_state *plane_state;
-	struct weston_buffer_viewport *viewport = &ev->surface->buffer_viewport;
 	struct wl_shm_buffer *shmbuf;
 	bool needs_update = false;
-	float x, y;
+
+	assert(!b->cursors_are_broken);
 
 	if (!plane)
-		return NULL;
-
-	if (b->cursors_are_broken)
 		return NULL;
 
 	if (!plane->state_cur->complete)
@@ -2905,41 +3428,49 @@ drm_output_prepare_cursor_view(struct drm_output_state *output_state,
 	if (plane->state_cur->output && plane->state_cur->output != output)
 		return NULL;
 
-	/* Don't import buffers which span multiple outputs. */
-	if (ev->output_mask != (1u << output->base.id))
-		return NULL;
-
 	/* We use GBM to import SHM buffers. */
 	if (b->gbm == NULL)
 		return NULL;
 
-	if (ev->surface->buffer_ref.buffer == NULL)
+	if (ev->surface->buffer_ref.buffer == NULL) {
+		drm_debug(b, "\t\t\t\t[cursor] not assigning view %p to cursor plane "
+			     "(no buffer available)\n", ev);
 		return NULL;
+	}
 	shmbuf = wl_shm_buffer_get(ev->surface->buffer_ref.buffer->resource);
-	if (!shmbuf)
+	if (!shmbuf) {
+		drm_debug(b, "\t\t\t\t[cursor] not assigning view %p to cursor plane "
+			     "(buffer isn't SHM)\n", ev);
 		return NULL;
-	if (wl_shm_buffer_get_format(shmbuf) != WL_SHM_FORMAT_ARGB8888)
+	}
+	if (wl_shm_buffer_get_format(shmbuf) != WL_SHM_FORMAT_ARGB8888) {
+		drm_debug(b, "\t\t\t\t[cursor] not assigning view %p to cursor plane "
+			     "(format 0x%lx unsuitable)\n",
+			  ev, (unsigned long) wl_shm_buffer_get_format(shmbuf));
 		return NULL;
-
-	if (output->base.transform != WL_OUTPUT_TRANSFORM_NORMAL)
-		return NULL;
-	if (ev->transform.enabled &&
-	    (ev->transform.matrix.type > WESTON_MATRIX_TRANSFORM_TRANSLATE))
-		return NULL;
-	if (viewport->buffer.scale != output->base.current_scale)
-		return NULL;
-	if (ev->geometry.scissor_enabled)
-		return NULL;
-
-	if (ev->surface->width > b->cursor_width ||
-	    ev->surface->height > b->cursor_height)
-		return NULL;
+	}
 
 	plane_state =
 		drm_output_state_get_plane(output_state, output->cursor_plane);
 
 	if (plane_state && plane_state->fb)
 		return NULL;
+
+	/* We can't scale with the legacy API, and we don't try to account for
+	 * simple cropping/translation in cursor_bo_update. */
+	plane_state->output = output;
+	if (!drm_plane_state_coords_for_view(plane_state, ev))
+		goto err;
+
+	if (plane_state->src_x != 0 || plane_state->src_y != 0 ||
+	    plane_state->src_w > (unsigned) b->cursor_width << 16 ||
+	    plane_state->src_h > (unsigned) b->cursor_height << 16 ||
+	    plane_state->src_w != plane_state->dest_w << 16 ||
+	    plane_state->src_h != plane_state->dest_h << 16) {
+		drm_debug(b, "\t\t\t\t[cursor] not assigning view %p to cursor plane "
+			     "(positioning requires cropping or scaling)\n", ev);
+		goto err;
+	}
 
 	/* Since we're setting plane state up front, we need to work out
 	 * whether or not we need to upload a new cursor. We can't use the
@@ -2957,26 +3488,33 @@ drm_output_prepare_cursor_view(struct drm_output_state *output_state,
 	}
 
 	output->cursor_view = ev;
-	weston_view_to_global_float(ev, 0, 0, &x, &y);
-	plane->base.x = x;
-	plane->base.y = y;
+	plane_state->ev = ev;
 
 	plane_state->fb =
 		drm_fb_ref(output->gbm_cursor_fb[output->current_cursor]);
-	plane_state->output = output;
-	plane_state->src_x = 0;
-	plane_state->src_y = 0;
+
+	if (needs_update) {
+		drm_debug(b, "\t\t\t\t[cursor] copying new content to cursor BO\n");
+		cursor_bo_update(plane_state, ev);
+	}
+
+	/* The cursor API is somewhat special: in cursor_bo_update(), we upload
+	 * a buffer which is always cursor_width x cursor_height, even if the
+	 * surface we want to promote is actually smaller than this. Manually
+	 * mangle the plane state to deal with this. */
 	plane_state->src_w = b->cursor_width << 16;
 	plane_state->src_h = b->cursor_height << 16;
-	plane_state->dest_x = (x - output->base.x) * output->base.current_scale;
-	plane_state->dest_y = (y - output->base.y) * output->base.current_scale;
 	plane_state->dest_w = b->cursor_width;
 	plane_state->dest_h = b->cursor_height;
 
-	if (needs_update)
-		cursor_bo_update(b, plane_state->fb->bo, ev);
+	drm_debug(b, "\t\t\t\t[cursor] provisionally assigned view %p to cursor\n",
+		  ev);
 
-	return &plane->base;
+	return plane_state;
+
+err:
+	drm_plane_state_put_back(plane_state);
+	return NULL;
 }
 
 static void
@@ -3032,23 +3570,68 @@ err:
 	drmModeSetCursor(b->drm.fd, output->crtc_id, 0, 0, 0);
 }
 
-static void
-drm_assign_planes(struct weston_output *output_base, void *repaint_data)
+static struct drm_output_state *
+drm_output_propose_state(struct weston_output *output_base,
+			 struct drm_pending_state *pending_state,
+			 enum drm_output_propose_state_mode mode)
 {
-	struct drm_backend *b = to_drm_backend(output_base->compositor);
-	struct drm_pending_state *pending_state = repaint_data;
 	struct drm_output *output = to_drm_output(output_base);
+	struct drm_backend *b = to_drm_backend(output->base.compositor);
 	struct drm_output_state *state;
-	struct drm_plane_state *plane_state;
+	struct drm_plane_state *scanout_state = NULL;
 	struct weston_view *ev;
-	pixman_region32_t surface_overlap, renderer_region;
-	struct weston_plane *primary, *next_plane;
-	bool picked_scanout = false;
+	pixman_region32_t surface_overlap, renderer_region, occluded_region;
+	bool planes_ok = (mode != DRM_OUTPUT_PROPOSE_STATE_RENDERER_ONLY);
+	bool renderer_ok = (mode != DRM_OUTPUT_PROPOSE_STATE_PLANES_ONLY);
+	int ret;
 
 	assert(!output->state_last);
 	state = drm_output_state_duplicate(output->state_cur,
 					   pending_state,
 					   DRM_OUTPUT_STATE_CLEAR_PLANES);
+
+	/* We implement mixed mode by progressively creating and testing
+	 * incremental states, of scanout + overlay + cursor. Since we
+	 * walk our views top to bottom, the scanout plane is last, however
+	 * we always need it in our scene for the test modeset to be
+	 * meaningful. To do this, we steal a reference to the last
+	 * renderer framebuffer we have, if we think it's basically
+	 * compatible. If we don't have that, then we conservatively fall
+	 * back to only using the renderer for this repaint. */
+	if (mode == DRM_OUTPUT_PROPOSE_STATE_MIXED) {
+		struct drm_plane *plane = output->scanout_plane;
+		struct drm_fb *scanout_fb = plane->state_cur->fb;
+
+		if (!scanout_fb ||
+		    (scanout_fb->type != BUFFER_GBM_SURFACE &&
+		     scanout_fb->type != BUFFER_PIXMAN_DUMB)) {
+			drm_debug(b, "\t\t[state] cannot propose mixed mode: "
+			             "for output %s (%lu): no previous renderer "
+			             "fb\n",
+				  output->base.name,
+				  (unsigned long) output->base.id);
+			drm_output_state_free(state);
+			return NULL;
+		}
+
+		if (scanout_fb->width != output_base->current_mode->width ||
+		    scanout_fb->height != output_base->current_mode->height) {
+			drm_debug(b, "\t\t[state] cannot propose mixed mode "
+			             "for output %s (%lu): previous fb has "
+				     "different size\n",
+				  output->base.name,
+				  (unsigned long) output->base.id);
+			drm_output_state_free(state);
+			return NULL;
+		}
+
+		scanout_state = drm_plane_state_duplicate(state,
+							  plane->state_cur);
+		drm_debug(b, "\t\t[state] using renderer FB ID %lu for mixed "
+			     "mode for output %s (%lu)\n",
+			  (unsigned long) scanout_fb->fb_id, output->base.name,
+			  (unsigned long) output->base.id);
+	}
 
 	/*
 	 * Find a surface for each sprite in the output using some heuristics:
@@ -3064,10 +3647,243 @@ drm_assign_planes(struct weston_output *output_base, void *repaint_data)
 	 * as we do for flipping full screen surfaces.
 	 */
 	pixman_region32_init(&renderer_region);
-	primary = &output_base->compositor->primary_plane;
+	pixman_region32_init(&occluded_region);
 
 	wl_list_for_each(ev, &output_base->compositor->view_list, link) {
-		struct weston_surface *es = ev->surface;
+		struct drm_plane_state *ps = NULL;
+		bool force_renderer = false;
+		pixman_region32_t clipped_view;
+		bool totally_occluded = false;
+		bool overlay_occluded = false;
+
+		drm_debug(b, "\t\t\t[view] evaluating view %p for "
+		             "output %s (%lu)\n",
+		          ev, output->base.name,
+			  (unsigned long) output->base.id);
+
+		/* If this view doesn't touch our output at all, there's no
+		 * reason to do anything with it. */
+		if (!(ev->output_mask & (1u << output->base.id))) {
+			drm_debug(b, "\t\t\t\t[view] ignoring view %p "
+			             "(not on our output)\n", ev);
+			continue;
+		}
+
+		/* We only assign planes to views which are exclusively present
+		 * on our output. */
+		if (ev->output_mask != (1u << output->base.id)) {
+			drm_debug(b, "\t\t\t\t[view] not assigning view %p to plane "
+			             "(on multiple outputs)\n", ev);
+			force_renderer = true;
+		}
+
+		if (!ev->surface->buffer_ref.buffer) {
+			drm_debug(b, "\t\t\t\t[view] not assigning view %p to plane "
+			             "(no buffer available)\n", ev);
+			force_renderer = true;
+		}
+
+		/* Ignore views we know to be totally occluded. */
+		pixman_region32_init(&clipped_view);
+		pixman_region32_intersect(&clipped_view,
+					  &ev->transform.boundingbox,
+					  &output->base.region);
+
+		pixman_region32_init(&surface_overlap);
+		pixman_region32_subtract(&surface_overlap, &clipped_view,
+					 &occluded_region);
+		totally_occluded = !pixman_region32_not_empty(&surface_overlap);
+		if (totally_occluded) {
+			drm_debug(b, "\t\t\t\t[view] ignoring view %p "
+			             "(occluded on our output)\n", ev);
+			pixman_region32_fini(&surface_overlap);
+			pixman_region32_fini(&clipped_view);
+			continue;
+		}
+
+		/* Since we process views from top to bottom, we know that if
+		 * the view intersects the calculated renderer region, it must
+		 * be part of, or occluded by, it, and cannot go on a plane. */
+		pixman_region32_intersect(&surface_overlap, &renderer_region,
+					  &clipped_view);
+		if (pixman_region32_not_empty(&surface_overlap)) {
+			drm_debug(b, "\t\t\t\t[view] not assigning view %p to plane "
+			             "(occluded by renderer views)\n", ev);
+			force_renderer = true;
+		}
+
+		/* We do not control the stacking order of overlay planes;
+		 * the scanout plane is strictly stacked bottom and the cursor
+		 * plane top, but the ordering of overlay planes with respect
+		 * to each other is undefined. Make sure we do not have two
+		 * planes overlapping each other. */
+		pixman_region32_intersect(&surface_overlap, &occluded_region,
+					  &clipped_view);
+		if (pixman_region32_not_empty(&surface_overlap)) {
+			drm_debug(b, "\t\t\t\t[view] not assigning view %p to plane "
+			             "(occluded by other overlay planes)\n", ev);
+			overlay_occluded = true;
+		}
+		pixman_region32_fini(&surface_overlap);
+
+		/* The cursor plane is 'special' in the sense that we can still
+		 * place it in the legacy API, and we gate that with a separate
+		 * cursors_are_broken flag. */
+		if (!force_renderer && !overlay_occluded && !b->cursors_are_broken)
+			ps = drm_output_prepare_cursor_view(state, ev);
+
+		/* If sprites are disabled or the view is not fully opaque, we
+		 * must put the view into the renderer - unless it has already
+		 * been placed in the cursor plane, which can handle alpha. */
+		if (!ps && !planes_ok) {
+			drm_debug(b, "\t\t\t\t[view] not assigning view %p to plane "
+			             "(precluded by mode)\n", ev);
+			force_renderer = true;
+		}
+		if (!ps && !weston_view_is_opaque(ev, &clipped_view)) {
+			drm_debug(b, "\t\t\t\t[view] not assigning view %p to plane "
+			             "(view not fully opaque)\n", ev);
+			force_renderer = true;
+		}
+
+		/* Only try to place scanout surfaces in planes-only mode; in
+		 * mixed mode, we have already failed to place a view on the
+		 * scanout surface, forcing usage of the renderer on the
+		 * scanout plane. */
+		if (!ps && !force_renderer && !renderer_ok)
+			ps = drm_output_prepare_scanout_view(state, ev, mode);
+
+		if (!ps && !overlay_occluded && !force_renderer)
+			ps = drm_output_prepare_overlay_view(state, ev, mode);
+
+		if (ps) {
+			/* If we have been assigned to an overlay or scanout
+			 * plane, add this area to the occluded region, so
+			 * other views are known to be behind it. The cursor
+			 * plane, however, is special, in that it blends with
+			 * the content underneath it: the area should neither
+			 * be added to the renderer region nor the occluded
+			 * region. */
+			if (ps->plane->type != WDRM_PLANE_TYPE_CURSOR) {
+				pixman_region32_union(&occluded_region,
+						      &occluded_region,
+						      &clipped_view);
+				pixman_region32_fini(&clipped_view);
+			}
+			continue;
+		}
+
+		/* We have been assigned to the primary (renderer) plane:
+		 * check if this is OK, and add ourselves to the renderer
+		 * region if so. */
+		if (!renderer_ok) {
+			drm_debug(b, "\t\t[view] failing state generation: "
+				      "placing view %p to renderer not allowed\n",
+				  ev);
+			pixman_region32_fini(&clipped_view);
+			goto err_region;
+		}
+
+		pixman_region32_union(&renderer_region,
+				      &renderer_region,
+				      &clipped_view);
+		pixman_region32_fini(&clipped_view);
+	}
+	pixman_region32_fini(&renderer_region);
+	pixman_region32_fini(&occluded_region);
+
+	/* In renderer-only mode, we can't test the state as we don't have a
+	 * renderer buffer yet. */
+	if (mode == DRM_OUTPUT_PROPOSE_STATE_RENDERER_ONLY)
+		return state;
+
+	/* Check to see if this state will actually work. */
+	ret = drm_pending_state_test(state->pending_state);
+	if (ret != 0) {
+		drm_debug(b, "\t\t[view] failing state generation: "
+			     "atomic test not OK\n");
+		goto err;
+	}
+
+	/* Counterpart to duplicating scanout state at the top of this
+	 * function: if we have taken a renderer framebuffer and placed it in
+	 * the pending state in order to incrementally test overlay planes,
+	 * remove it now. */
+	if (mode == DRM_OUTPUT_PROPOSE_STATE_MIXED) {
+		assert(scanout_state->fb->type == BUFFER_GBM_SURFACE ||
+		       scanout_state->fb->type == BUFFER_PIXMAN_DUMB);
+		drm_plane_state_put_back(scanout_state);
+	}
+	return state;
+
+err_region:
+	pixman_region32_fini(&renderer_region);
+	pixman_region32_fini(&occluded_region);
+err:
+	drm_output_state_free(state);
+	return NULL;
+}
+
+static const char *
+drm_propose_state_mode_to_string(enum drm_output_propose_state_mode mode)
+{
+	if (mode < 0 || mode >= ARRAY_LENGTH(drm_output_propose_state_mode_as_string))
+		return " unknown compositing mode";
+
+	return drm_output_propose_state_mode_as_string[mode];
+}
+
+static void
+drm_assign_planes(struct weston_output *output_base, void *repaint_data)
+{
+	struct drm_backend *b = to_drm_backend(output_base->compositor);
+	struct drm_pending_state *pending_state = repaint_data;
+	struct drm_output *output = to_drm_output(output_base);
+	struct drm_output_state *state = NULL;
+	struct drm_plane_state *plane_state;
+	struct weston_view *ev;
+	struct weston_plane *primary = &output_base->compositor->primary_plane;
+	enum drm_output_propose_state_mode mode = DRM_OUTPUT_PROPOSE_STATE_PLANES_ONLY;
+
+	drm_debug(b, "\t[repaint] preparing state for output %s (%lu)\n",
+		  output_base->name, (unsigned long) output_base->id);
+
+	if (!b->sprites_are_broken && !output->virtual) {
+		drm_debug(b, "\t[repaint] trying planes-only build state\n");
+		state = drm_output_propose_state(output_base, pending_state, mode);
+		if (!state) {
+			drm_debug(b, "\t[repaint] could not build planes-only "
+				     "state, trying mixed\n");
+			mode = DRM_OUTPUT_PROPOSE_STATE_MIXED;
+			state = drm_output_propose_state(output_base,
+							 pending_state,
+							 mode);
+		}
+		if (!state) {
+			drm_debug(b, "\t[repaint] could not build mixed-mode "
+				     "state, trying renderer-only\n");
+		}
+	} else {
+		drm_debug(b, "\t[state] no overlay plane support\n");
+	}
+
+	if (!state) {
+		mode = DRM_OUTPUT_PROPOSE_STATE_RENDERER_ONLY;
+		state = drm_output_propose_state(output_base, pending_state,
+						 mode);
+	}
+
+	assert(state);
+	drm_debug(b, "\t[repaint] Using %s composition\n",
+		  drm_propose_state_mode_to_string(mode));
+
+	wl_list_for_each(ev, &output_base->compositor->view_list, link) {
+		struct drm_plane *target_plane = NULL;
+
+		/* If this view doesn't touch our output at all, there's no
+		 * reason to do anything with it. */
+		if (!(ev->output_mask & (1u << output->base.id)))
+			continue;
 
 		/* Test whether this buffer can ever go into a plane:
 		 * non-shm, or small enough to be a cursor.
@@ -3078,50 +3894,41 @@ drm_assign_planes(struct weston_output *output_base, void *repaint_data)
 		 * to the buffer anyway, there is no side effects.
 		 */
 		if (b->use_pixman ||
-		     (es->buffer_ref.buffer &&
-		     (!wl_shm_buffer_get(es->buffer_ref.buffer->resource) ||
+		    (ev->surface->buffer_ref.buffer &&
+		    (!wl_shm_buffer_get(ev->surface->buffer_ref.buffer->resource) ||
 		     (ev->surface->width <= b->cursor_width &&
 		      ev->surface->height <= b->cursor_height))))
-			es->keep_buffer = true;
+			ev->surface->keep_buffer = true;
 		else
-			es->keep_buffer = false;
+			ev->surface->keep_buffer = false;
 
-		pixman_region32_init(&surface_overlap);
-		pixman_region32_intersect(&surface_overlap, &renderer_region,
-					  &ev->transform.boundingbox);
-
-		next_plane = NULL;
-		if (pixman_region32_not_empty(&surface_overlap) || picked_scanout)
-			next_plane = primary;
-		if (next_plane == NULL)
-			next_plane = drm_output_prepare_cursor_view(state, ev);
-
-		/* If a higher-stacked view already got assigned to scanout, it's incorrect to
-		 * assign a subsequent (lower-stacked) view to scanout.
-		 */
-		if (next_plane == NULL) {
-			next_plane = drm_output_prepare_scanout_view(state, ev);
-			if (next_plane)
-				picked_scanout = true;
+		/* This is a bit unpleasant, but lacking a temporary place to
+		 * hang a plane off the view, we have to do a nested walk.
+		 * Our first-order iteration has to be planes rather than
+		 * views, because otherwise we won't reset views which were
+		 * previously on planes to being on the primary plane. */
+		wl_list_for_each(plane_state, &state->plane_list, link) {
+			if (plane_state->ev == ev) {
+				plane_state->ev = NULL;
+				target_plane = plane_state->plane;
+				break;
+			}
 		}
 
-		if (next_plane == NULL)
-			next_plane = drm_output_prepare_overlay_view(state, ev);
+		if (target_plane) {
+			drm_debug(b, "\t[repaint] view %p on %s plane %lu\n",
+				  ev, plane_type_enums[target_plane->type].name,
+				  (unsigned long) target_plane->plane_id);
+			weston_view_move_to_plane(ev, &target_plane->base);
+		} else {
+			drm_debug(b, "\t[repaint] view %p using renderer "
+				     "composition\n", ev);
+			weston_view_move_to_plane(ev, primary);
+		}
 
-		if (next_plane == NULL)
-			next_plane = primary;
-
-		weston_view_move_to_plane(ev, next_plane);
-
-		if (next_plane == primary)
-			pixman_region32_union(&renderer_region,
-					      &renderer_region,
-					      &ev->transform.boundingbox);
-
-		if (next_plane == primary ||
-		    (output->cursor_plane &&
-		     next_plane == &output->cursor_plane->base)) {
-			/* cursor plane involves a copy */
+		if (!target_plane ||
+		    target_plane->type == WDRM_PLANE_TYPE_CURSOR) {
+			/* cursor plane & renderer involve a copy */
 			ev->psf_flags = 0;
 		} else {
 			/* All other planes are a direct scanout of a
@@ -3129,10 +3936,7 @@ drm_assign_planes(struct weston_output *output_base, void *repaint_data)
 			 */
 			ev->psf_flags = WP_PRESENTATION_FEEDBACK_KIND_ZERO_COPY;
 		}
-
-		pixman_region32_fini(&surface_overlap);
 	}
-	pixman_region32_fini(&renderer_region);
 
 	/* We rely on output->cursor_view being both an accurate reflection of
 	 * the cursor plane's state, but also being maintained across repaints
@@ -3146,6 +3950,29 @@ drm_assign_planes(struct weston_output *output_base, void *repaint_data)
 		if (!plane_state || !plane_state->fb)
 			output->cursor_view = NULL;
 	}
+}
+
+/*
+ * Get the aspect-ratio from drmModeModeInfo mode flags.
+ *
+ * @param drm_mode_flags- flags from drmModeModeInfo structure.
+ * @returns aspect-ratio as encoded in enum 'weston_mode_aspect_ratio'.
+ */
+static enum weston_mode_aspect_ratio
+drm_to_weston_mode_aspect_ratio(uint32_t drm_mode_flags)
+{
+	return (drm_mode_flags & DRM_MODE_FLAG_PIC_AR_MASK) >>
+		DRM_MODE_FLAG_PIC_AR_BITS_POS;
+}
+
+static const char *
+aspect_ratio_to_string(enum weston_mode_aspect_ratio ratio)
+{
+	if (ratio < 0 || ratio >= ARRAY_LENGTH(aspect_ratio_as_string) ||
+	    !aspect_ratio_as_string[ratio])
+		return " (unknown aspect ratio)";
+
+	return aspect_ratio_as_string[ratio];
 }
 
 /**
@@ -3162,24 +3989,42 @@ drm_assign_planes(struct weston_output *output_base, void *repaint_data)
 static struct drm_mode *
 choose_mode (struct drm_output *output, struct weston_mode *target_mode)
 {
-	struct drm_mode *tmp_mode = NULL, *mode;
+	struct drm_mode *tmp_mode = NULL, *mode_fall_back = NULL, *mode;
+	enum weston_mode_aspect_ratio src_aspect = WESTON_MODE_PIC_AR_NONE;
+	enum weston_mode_aspect_ratio target_aspect = WESTON_MODE_PIC_AR_NONE;
+	struct drm_backend *b;
 
+	b = to_drm_backend(output->base.compositor);
+	target_aspect = target_mode->aspect_ratio;
+	src_aspect = output->base.current_mode->aspect_ratio;
 	if (output->base.current_mode->width == target_mode->width &&
 	    output->base.current_mode->height == target_mode->height &&
 	    (output->base.current_mode->refresh == target_mode->refresh ||
-	     target_mode->refresh == 0))
-		return to_drm_mode(output->base.current_mode);
+	     target_mode->refresh == 0)) {
+		if (!b->aspect_ratio_supported || src_aspect == target_aspect)
+			return to_drm_mode(output->base.current_mode);
+	}
 
 	wl_list_for_each(mode, &output->base.mode_list, base.link) {
+
+		src_aspect = mode->base.aspect_ratio;
 		if (mode->mode_info.hdisplay == target_mode->width &&
 		    mode->mode_info.vdisplay == target_mode->height) {
 			if (mode->base.refresh == target_mode->refresh ||
 			    target_mode->refresh == 0) {
-				return mode;
-			} else if (!tmp_mode)
+				if (!b->aspect_ratio_supported ||
+				    src_aspect == target_aspect)
+					return mode;
+				else if (!mode_fall_back)
+					mode_fall_back = mode;
+			} else if (!tmp_mode) {
 				tmp_mode = mode;
+			}
 		}
 	}
+
+	if (mode_fall_back)
+		return mode_fall_back;
 
 	return tmp_mode;
 }
@@ -3318,6 +4163,30 @@ init_kms_caps(struct drm_backend *b)
 	weston_log("DRM: %s atomic modesetting\n",
 		   b->atomic_modeset ? "supports" : "does not support");
 
+#ifdef HAVE_DRM_ADDFB2_MODIFIERS
+	ret = drmGetCap(b->drm.fd, DRM_CAP_ADDFB2_MODIFIERS, &cap);
+	if (ret == 0)
+		b->fb_modifiers = cap;
+	else
+#endif
+		b->fb_modifiers = 0;
+
+	/*
+	 * KMS support for hardware planes cannot properly synchronize
+	 * without nuclear page flip. Without nuclear/atomic, hw plane
+	 * and cursor plane updates would either tear or cause extra
+	 * waits for vblanks which means dropping the compositor framerate
+	 * to a fraction. For cursors, it's not so bad, so they are
+	 * enabled.
+	 */
+	if (!b->atomic_modeset || getenv("WESTON_FORCE_RENDERER"))
+		b->sprites_are_broken = 1;
+
+	ret = drmSetClientCap(b->drm.fd, DRM_CLIENT_CAP_ASPECT_RATIO, 1);
+	b->aspect_ratio_supported = (ret == 0);
+	weston_log("DRM: %s picture aspect ratio\n",
+		   b->aspect_ratio_supported ? "supports" : "does not support");
+
 	return 0;
 }
 
@@ -3413,6 +4282,100 @@ init_pixman(struct drm_backend *b)
 	return pixman_renderer_init(b->compositor);
 }
 
+#ifdef HAVE_DRM_FORMATS_BLOB
+static inline uint32_t *
+formats_ptr(struct drm_format_modifier_blob *blob)
+{
+	return (uint32_t *)(((char *)blob) + blob->formats_offset);
+}
+
+static inline struct drm_format_modifier *
+modifiers_ptr(struct drm_format_modifier_blob *blob)
+{
+	return (struct drm_format_modifier *)
+		(((char *)blob) + blob->modifiers_offset);
+}
+#endif
+
+/**
+ * Populates the plane's formats array, using either the IN_FORMATS blob
+ * property (if available), or the plane's format list if not.
+ */
+static int
+drm_plane_populate_formats(struct drm_plane *plane, const drmModePlane *kplane,
+			   const drmModeObjectProperties *props)
+{
+	unsigned i;
+#ifdef HAVE_DRM_FORMATS_BLOB
+	drmModePropertyBlobRes *blob;
+	struct drm_format_modifier_blob *fmt_mod_blob;
+	struct drm_format_modifier *blob_modifiers;
+	uint32_t *blob_formats;
+	uint32_t blob_id;
+
+	blob_id = drm_property_get_value(&plane->props[WDRM_PLANE_IN_FORMATS],
+				         props,
+				         0);
+	if (blob_id == 0)
+		goto fallback;
+
+	blob = drmModeGetPropertyBlob(plane->backend->drm.fd, blob_id);
+	if (!blob)
+		goto fallback;
+
+	fmt_mod_blob = blob->data;
+	blob_formats = formats_ptr(fmt_mod_blob);
+	blob_modifiers = modifiers_ptr(fmt_mod_blob);
+
+	if (plane->count_formats != fmt_mod_blob->count_formats) {
+		weston_log("DRM backend: format count differs between "
+		           "plane (%d) and IN_FORMATS (%d)\n",
+			   plane->count_formats,
+			   fmt_mod_blob->count_formats);
+		weston_log("This represents a kernel bug; Weston is "
+			   "unable to continue.\n");
+		abort();
+	}
+
+	for (i = 0; i < fmt_mod_blob->count_formats; i++) {
+		uint32_t count_modifiers = 0;
+		uint64_t *modifiers = NULL;
+		unsigned j;
+
+		for (j = 0; j < fmt_mod_blob->count_modifiers; j++) {
+			struct drm_format_modifier *mod = &blob_modifiers[j];
+
+			if ((i < mod->offset) || (i > mod->offset + 63))
+				continue;
+			if (!(mod->formats & (1 << (i - mod->offset))))
+				continue;
+
+			modifiers = realloc(modifiers,
+					    (count_modifiers + 1) *
+					     sizeof(modifiers[0]));
+			assert(modifiers);
+			modifiers[count_modifiers++] = mod->modifier;
+		}
+
+		plane->formats[i].format = blob_formats[i];
+		plane->formats[i].modifiers = modifiers;
+		plane->formats[i].count_modifiers = count_modifiers;
+	}
+
+	drmModeFreePropertyBlob(blob);
+
+	return 0;
+
+fallback:
+#endif
+	/* No IN_FORMATS blob available, so just use the old. */
+	assert(plane->count_formats == kplane->count_formats);
+	for (i = 0; i < kplane->count_formats; i++)
+		plane->formats[i].format = kplane->formats[i];
+
+	return 0;
+}
+
 /**
  * Create a drm_plane for a hardware plane
  *
@@ -3442,25 +4405,23 @@ drm_plane_create(struct drm_backend *b, const drmModePlane *kplane,
 {
 	struct drm_plane *plane;
 	drmModeObjectProperties *props;
-	int num_formats = (kplane) ? kplane->count_formats : 1;
+	uint32_t num_formats = (kplane) ? kplane->count_formats : 1;
 
 	plane = zalloc(sizeof(*plane) +
-		       (sizeof(uint32_t) * num_formats));
+		       (sizeof(plane->formats[0]) * num_formats));
 	if (!plane) {
 		weston_log("%s: out of memory\n", __func__);
 		return NULL;
 	}
 
 	plane->backend = b;
+	plane->count_formats = num_formats;
 	plane->state_cur = drm_plane_state_alloc(NULL, plane);
 	plane->state_cur->complete = true;
 
 	if (kplane) {
 		plane->possible_crtcs = kplane->possible_crtcs;
 		plane->plane_id = kplane->plane_id;
-		plane->count_formats = kplane->count_formats;
-		memcpy(plane->formats, kplane->formats,
-		       kplane->count_formats * sizeof(kplane->formats[0]));
 
 		props = drmModeObjectGetProperties(b->drm.fd, kplane->plane_id,
 						   DRM_MODE_OBJECT_PLANE);
@@ -3474,13 +4435,19 @@ drm_plane_create(struct drm_backend *b, const drmModePlane *kplane,
 			drm_property_get_value(&plane->props[WDRM_PLANE_TYPE],
 					       props,
 					       WDRM_PLANE_TYPE__COUNT);
+
+		if (drm_plane_populate_formats(plane, kplane, props) < 0) {
+			drmModeFreeObjectProperties(props);
+			goto err;
+		}
+
 		drmModeFreeObjectProperties(props);
 	}
 	else {
 		plane->possible_crtcs = (1 << output->pipe);
 		plane->plane_id = 0;
 		plane->count_formats = 1;
-		plane->formats[0] = format;
+		plane->formats[0].format = format;
 		plane->type = type;
 	}
 
@@ -3574,14 +4541,6 @@ drm_output_find_special_plane(struct drm_backend *b, struct drm_output *output,
 		/* On some platforms, primary/cursor planes can roam
 		 * between different CRTCs, so make sure we don't claim the
 		 * same plane for two outputs. */
-		wl_list_for_each(tmp, &b->compositor->pending_output_list,
-				 base.link) {
-			if (tmp->cursor_plane == plane ||
-			    tmp->scanout_plane == plane) {
-				found_elsewhere = true;
-				break;
-			}
-		}
 		wl_list_for_each(tmp, &b->compositor->output_list,
 				 base.link) {
 			if (tmp->cursor_plane == plane ||
@@ -3619,6 +4578,63 @@ drm_plane_destroy(struct drm_plane *plane)
 	drm_property_info_free(plane->props, WDRM_PLANE__COUNT);
 	weston_plane_release(&plane->base);
 	wl_list_remove(&plane->link);
+	free(plane);
+}
+
+/**
+ * Create a drm_plane for virtual output
+ *
+ * Call drm_virtual_plane_destroy to clean up the plane.
+ *
+ * @param b DRM compositor backend
+ * @param output Output to create internal plane for
+ */
+static struct drm_plane *
+drm_virtual_plane_create(struct drm_backend *b, struct drm_output *output)
+{
+	struct drm_plane *plane;
+
+	/* num of formats is one */
+	plane = zalloc(sizeof(*plane) + sizeof(plane->formats[0]));
+	if (!plane) {
+		weston_log("%s: out of memory\n", __func__);
+		return NULL;
+	}
+
+	plane->type = WDRM_PLANE_TYPE_PRIMARY;
+	plane->backend = b;
+	plane->state_cur = drm_plane_state_alloc(NULL, plane);
+	plane->state_cur->complete = true;
+	plane->formats[0].format = output->gbm_format;
+	plane->count_formats = 1;
+	if ((output->gbm_bo_flags & GBM_BO_USE_LINEAR) && b->fb_modifiers) {
+		uint64_t *modifiers = zalloc(sizeof *modifiers);
+		if (modifiers) {
+			*modifiers = DRM_FORMAT_MOD_LINEAR;
+			plane->formats[0].modifiers = modifiers;
+			plane->formats[0].count_modifiers = 1;
+		}
+	}
+
+	weston_plane_init(&plane->base, b->compositor, 0, 0);
+	wl_list_insert(&b->plane_list, &plane->link);
+
+	return plane;
+}
+
+/**
+ * Destroy one DRM plane
+ *
+ * @param plane Plane to deallocate (will be freed)
+ */
+static void
+drm_virtual_plane_destroy(struct drm_plane *plane)
+{
+	drm_plane_state_free(plane->state_cur, true);
+	weston_plane_release(&plane->base);
+	wl_list_remove(&plane->link);
+	if (plane->formats[0].modifiers)
+		free(plane->formats[0].modifiers);
 	free(plane);
 }
 
@@ -3730,6 +4746,8 @@ drm_output_add_mode(struct drm_output *output, const drmModeModeInfo *info)
 	if (info->type & DRM_MODE_TYPE_PREFERRED)
 		mode->base.flags |= WL_OUTPUT_MODE_PREFERRED;
 
+	mode->base.aspect_ratio = drm_to_weston_mode_aspect_ratio(info->flags);
+
 	wl_list_insert(output->base.mode_list.prev, &mode->base.link);
 
 	return mode;
@@ -3783,12 +4801,12 @@ drm_subpixel_to_wayland(int drm_value)
 
 /* returns a value between 0-255 range, where higher is brighter */
 static uint32_t
-drm_get_backlight(struct drm_output *output)
+drm_get_backlight(struct drm_head *head)
 {
 	long brightness, max_brightness, norm;
 
-	brightness = backlight_get_brightness(output->backlight);
-	max_brightness = backlight_get_max_brightness(output->backlight);
+	brightness = backlight_get_brightness(head->backlight);
+	max_brightness = backlight_get_max_brightness(head->backlight);
 
 	/* convert it on a scale of 0 to 255 */
 	norm = (brightness * 255)/(max_brightness);
@@ -3801,20 +4819,47 @@ static void
 drm_set_backlight(struct weston_output *output_base, uint32_t value)
 {
 	struct drm_output *output = to_drm_output(output_base);
+	struct drm_head *head;
 	long max_brightness, new_brightness;
-
-	if (!output->backlight)
-		return;
 
 	if (value > 255)
 		return;
 
-	max_brightness = backlight_get_max_brightness(output->backlight);
+	wl_list_for_each(head, &output->base.head_list, base.output_link) {
+		if (!head->backlight)
+			return;
 
-	/* get denormalized value */
-	new_brightness = (value * max_brightness) / 255;
+		max_brightness = backlight_get_max_brightness(head->backlight);
 
-	backlight_set_brightness(output->backlight, new_brightness);
+		/* get denormalized value */
+		new_brightness = (value * max_brightness) / 255;
+
+		backlight_set_brightness(head->backlight, new_brightness);
+	}
+}
+
+static void
+drm_output_init_backlight(struct drm_output *output)
+{
+	struct weston_head *base;
+	struct drm_head *head;
+
+	output->base.set_backlight = NULL;
+
+	wl_list_for_each(base, &output->base.head_list, output_link) {
+		head = to_drm_head(base);
+
+		if (head->backlight) {
+			weston_log("Initialized backlight for head '%s', device %s\n",
+				   head->base.name, head->backlight->path);
+
+			if (!output->base.set_backlight) {
+				output->base.set_backlight = drm_set_backlight;
+				output->base.backlight_current =
+							drm_get_backlight(head);
+			}
+		}
+	}
 }
 
 /**
@@ -3826,6 +4871,8 @@ drm_set_backlight(struct weston_output *output_base, uint32_t value)
  *
  * If we are called as part of repaint, we simply set the relevant bit in
  * state and return.
+ *
+ * This function is never called on a virtual output.
  */
 static void
 drm_set_dpms(struct weston_output *output_base, enum dpms_enum level)
@@ -3835,6 +4882,8 @@ drm_set_dpms(struct weston_output *output_base, enum dpms_enum level)
 	struct drm_pending_state *pending_state = b->repaint_data;
 	struct drm_output_state *state;
 	int ret;
+
+	assert(!output->virtual);
 
 	if (output->state_cur->dpms == level)
 		return;
@@ -3905,6 +4954,9 @@ static const char * const connector_type_names[] = {
 	[DRM_MODE_CONNECTOR_VIRTUAL]     = "Virtual",
 	[DRM_MODE_CONNECTOR_DSI]         = "DSI",
 #endif
+#ifdef DRM_MODE_CONNECTOR_DPI
+	[DRM_MODE_CONNECTOR_DPI]         = "DPI",
+#endif
 };
 
 /** Create a name given a DRM connector
@@ -3933,51 +4985,6 @@ make_connector_name(const drmModeConnector *con)
 		return NULL;
 
 	return name;
-}
-
-static int
-find_crtc_for_connector(struct drm_backend *b,
-			drmModeRes *resources, drmModeConnector *connector)
-{
-	drmModeEncoder *encoder;
-	int i, j;
-	int ret = -1;
-
-	for (j = 0; j < connector->count_encoders; j++) {
-		uint32_t possible_crtcs, encoder_id, crtc_id;
-
-		encoder = drmModeGetEncoder(b->drm.fd, connector->encoders[j]);
-		if (encoder == NULL) {
-			weston_log("Failed to get encoder.\n");
-			continue;
-		}
-		encoder_id = encoder->encoder_id;
-		possible_crtcs = encoder->possible_crtcs;
-		crtc_id = encoder->crtc_id;
-		drmModeFreeEncoder(encoder);
-
-		for (i = 0; i < resources->count_crtcs; i++) {
-			if (!(possible_crtcs & (1 << i)))
-				continue;
-
-			if (drm_output_find_by_crtc(b, resources->crtcs[i]))
-				continue;
-
-			/* Try to preserve the existing
-			 * CRTC -> encoder -> connector routing; it makes
-			 * initialisation faster, and also since we have a
-			 * very dumb picking algorithm, may preserve a better
-			 * choice. */
-			if (!connector->encoder_id ||
-			    (encoder_id == connector->encoder_id &&
-			     crtc_id == resources->crtcs[i]))
-				return i;
-
-			ret = i;
-		}
-	}
-
-	return ret;
 }
 
 static void drm_output_fini_cursor_egl(struct drm_output *output)
@@ -4009,8 +5016,7 @@ drm_output_init_cursor_egl(struct drm_output *output, struct drm_backend *b)
 			goto err;
 
 		output->gbm_cursor_fb[i] =
-			drm_fb_get_from_bo(bo, b, GBM_FORMAT_ARGB8888,
-					   BUFFER_CURSOR);
+			drm_fb_get_from_bo(bo, b, false, BUFFER_CURSOR);
 		if (!output->gbm_cursor_fb[i]) {
 			gbm_bo_destroy(bo);
 			goto err;
@@ -4035,13 +5041,46 @@ drm_output_init_egl(struct drm_output *output, struct drm_backend *b)
 		fallback_format_for(output->gbm_format),
 	};
 	int n_formats = 1;
+	struct weston_mode *mode = output->base.current_mode;
+	struct drm_plane *plane = output->scanout_plane;
+	unsigned int i;
 
-	output->gbm_surface = gbm_surface_create(b->gbm,
-					     output->base.current_mode->width,
-					     output->base.current_mode->height,
-					     format[0],
-					     GBM_BO_USE_SCANOUT |
-					     GBM_BO_USE_RENDERING);
+	assert(output->gbm_surface == NULL);
+
+	for (i = 0; i < plane->count_formats; i++) {
+		if (plane->formats[i].format == output->gbm_format)
+			break;
+	}
+
+	if (i == plane->count_formats) {
+		weston_log("format 0x%x not supported by output %s\n",
+			   output->gbm_format, output->base.name);
+		return -1;
+	}
+
+#ifdef HAVE_GBM_MODIFIERS
+	if (plane->formats[i].count_modifiers > 0) {
+		output->gbm_surface =
+			gbm_surface_create_with_modifiers(b->gbm,
+							  mode->width,
+							  mode->height,
+							  output->gbm_format,
+							  plane->formats[i].modifiers,
+							  plane->formats[i].count_modifiers);
+	}
+
+	/* If allocating with modifiers fails, try again without. This can
+	 * happen when the KMS display device supports modifiers but the
+	 * GBM driver does not, e.g. the old i915 Mesa driver. */
+	if (!output->gbm_surface)
+#endif
+	{
+		output->gbm_surface =
+		    gbm_surface_create(b->gbm, mode->width, mode->height,
+				       output->gbm_format,
+				       output->gbm_bo_flags);
+	}
+
 	if (!output->gbm_surface) {
 		weston_log("failed to create gbm surface\n");
 		return -1;
@@ -4057,6 +5096,7 @@ drm_output_init_egl(struct drm_output *output, struct drm_backend *b)
 					      n_formats) < 0) {
 		weston_log("failed to create gl renderer output state\n");
 		gbm_surface_destroy(output->gbm_surface);
+		output->gbm_surface = NULL;
 		return -1;
 	}
 
@@ -4083,6 +5123,7 @@ drm_output_fini_egl(struct drm_output *output)
 
 	gl_renderer->output_destroy(&output->base);
 	gbm_surface_destroy(output->gbm_surface);
+	output->gbm_surface = NULL;
 	drm_output_fini_cursor_egl(output);
 }
 
@@ -4094,6 +5135,7 @@ drm_output_init_pixman(struct drm_output *output, struct drm_backend *b)
 	uint32_t format = output->gbm_format;
 	uint32_t pixman_format;
 	unsigned int i;
+	uint32_t flags = 0;
 
 	switch (format) {
 		case GBM_FORMAT_XRGB8888:
@@ -4116,13 +5158,19 @@ drm_output_init_pixman(struct drm_output *output, struct drm_backend *b)
 		output->image[i] =
 			pixman_image_create_bits(pixman_format, w, h,
 						 output->dumb[i]->map,
-						 output->dumb[i]->stride);
+						 output->dumb[i]->strides[0]);
 		if (!output->image[i])
 			goto err;
 	}
 
-	if (pixman_renderer_output_create(&output->base) < 0)
+	if (b->use_pixman_shadow)
+		flags |= PIXMAN_RENDERER_OUTPUT_USE_SHADOW;
+
+	if (pixman_renderer_output_create(&output->base, flags) < 0)
 		goto err;
+
+	weston_log("DRM: output %s %s shadow framebuffer.\n", output->base.name,
+		   b->use_pixman_shadow ? "uses" : "does not use");
 
 	pixman_region32_init_rect(&output->previous_damage,
 				  output->base.x, output->base.y, output->base.width, output->base.height);
@@ -4271,8 +5319,7 @@ edid_parse(struct drm_edid *edid, const uint8_t *data, size_t length)
 
 /** Parse monitor make, model and serial from EDID
  *
- * \param b The backend instance.
- * \param output The output whose \c drm_edid to fill in.
+ * \param head The head whose \c drm_edid to fill in.
  * \param props The DRM connector properties to get the EDID from.
  * \param make[out] The monitor make (PNP ID).
  * \param model[out] The monitor model (name).
@@ -4281,10 +5328,10 @@ edid_parse(struct drm_edid *edid, const uint8_t *data, size_t length)
  * Each of \c *make, \c *model and \c *serial_number are set only if the
  * information is found in the EDID. The pointers they are set to must not
  * be free()'d explicitly, instead they get implicitly freed when the
- * \c drm_output is destroyed.
+ * \c drm_head is destroyed.
  */
 static void
-find_and_parse_output_edid(struct drm_backend *b, struct drm_output *output,
+find_and_parse_output_edid(struct drm_head *head,
 			   drmModeObjectPropertiesPtr props,
 			   const char **make,
 			   const char **model,
@@ -4295,31 +5342,36 @@ find_and_parse_output_edid(struct drm_backend *b, struct drm_output *output,
 	int rc;
 
 	blob_id =
-		drm_property_get_value(&output->props_conn[WDRM_CONNECTOR_EDID],
+		drm_property_get_value(&head->props_conn[WDRM_CONNECTOR_EDID],
 				       props, 0);
 	if (!blob_id)
 		return;
 
-	edid_blob = drmModeGetPropertyBlob(b->drm.fd, blob_id);
+	edid_blob = drmModeGetPropertyBlob(head->backend->drm.fd, blob_id);
 	if (!edid_blob)
 		return;
 
-	rc = edid_parse(&output->edid,
+	rc = edid_parse(&head->edid,
 			edid_blob->data,
 			edid_blob->length);
 	if (!rc) {
-		weston_log("EDID data '%s', '%s', '%s'\n",
-			   output->edid.pnp_id,
-			   output->edid.monitor_name,
-			   output->edid.serial_number);
-		if (output->edid.pnp_id[0] != '\0')
-			*make = output->edid.pnp_id;
-		if (output->edid.monitor_name[0] != '\0')
-			*model = output->edid.monitor_name;
-		if (output->edid.serial_number[0] != '\0')
-			*serial_number = output->edid.serial_number;
+		if (head->edid.pnp_id[0] != '\0')
+			*make = head->edid.pnp_id;
+		if (head->edid.monitor_name[0] != '\0')
+			*model = head->edid.monitor_name;
+		if (head->edid.serial_number[0] != '\0')
+			*serial_number = head->edid.serial_number;
 	}
 	drmModeFreePropertyBlob(edid_blob);
+}
+
+static bool
+check_non_desktop(struct drm_head *head, drmModeObjectPropertiesPtr props)
+{
+	struct drm_property_info *non_desktop_info =
+		&head->props_conn[WDRM_CONNECTOR_NON_DESKTOP];
+
+	return drm_property_get_value(non_desktop_info, props, 0);
 }
 
 static int
@@ -4350,16 +5402,16 @@ parse_modeline(const char *s, drmModeModeInfo *mode)
 		return -1;
 
 	mode->clock = fclock * 1000;
-	if (strcmp(hsync, "+hsync") == 0)
+	if (strcasecmp(hsync, "+hsync") == 0)
 		mode->flags |= DRM_MODE_FLAG_PHSYNC;
-	else if (strcmp(hsync, "-hsync") == 0)
+	else if (strcasecmp(hsync, "-hsync") == 0)
 		mode->flags |= DRM_MODE_FLAG_NHSYNC;
 	else
 		return -1;
 
-	if (strcmp(vsync, "+vsync") == 0)
+	if (strcasecmp(vsync, "+vsync") == 0)
 		mode->flags |= DRM_MODE_FLAG_PVSYNC;
-	else if (strcmp(vsync, "-vsync") == 0)
+	else if (strcasecmp(vsync, "-vsync") == 0)
 		mode->flags |= DRM_MODE_FLAG_NVSYNC;
 	else
 		return -1;
@@ -4394,24 +5446,203 @@ setup_output_seat_constraint(struct drm_backend *b,
 }
 
 static int
+drm_output_attach_head(struct weston_output *output_base,
+		       struct weston_head *head_base)
+{
+	struct drm_backend *b = to_drm_backend(output_base->compositor);
+
+	if (wl_list_length(&output_base->head_list) >= MAX_CLONED_CONNECTORS)
+		return -1;
+
+	if (!output_base->enabled)
+		return 0;
+
+	/* XXX: ensure the configuration will work.
+	 * This is actually impossible without major infrastructure
+	 * work. */
+
+	/* Need to go through modeset to add connectors. */
+	/* XXX: Ideally we'd do this per-output, not globally. */
+	/* XXX: Doing it globally, what guarantees another output's update
+	 * will not clear the flag before this output is updated?
+	 */
+	b->state_invalid = true;
+
+	weston_output_schedule_repaint(output_base);
+
+	return 0;
+}
+
+static void
+drm_output_detach_head(struct weston_output *output_base,
+		       struct weston_head *head_base)
+{
+	struct drm_backend *b = to_drm_backend(output_base->compositor);
+
+	if (!output_base->enabled)
+		return;
+
+	/* Need to go through modeset to drop connectors that should no longer
+	 * be driven. */
+	/* XXX: Ideally we'd do this per-output, not globally. */
+	b->state_invalid = true;
+
+	weston_output_schedule_repaint(output_base);
+}
+
+static int
 parse_gbm_format(const char *s, uint32_t default_value, uint32_t *gbm_format)
 {
-	int ret = 0;
+	const struct pixel_format_info *pinfo;
 
-	if (s == NULL)
+	if (s == NULL) {
 		*gbm_format = default_value;
-	else if (strcmp(s, "xrgb8888") == 0)
-		*gbm_format = GBM_FORMAT_XRGB8888;
-	else if (strcmp(s, "rgb565") == 0)
-		*gbm_format = GBM_FORMAT_RGB565;
-	else if (strcmp(s, "xrgb2101010") == 0)
-		*gbm_format = GBM_FORMAT_XRGB2101010;
-	else {
-		weston_log("fatal: unrecognized pixel format: %s\n", s);
-		ret = -1;
+
+		return 0;
 	}
 
-	return ret;
+	pinfo = pixel_format_get_info_by_drm_name(s);
+	if (!pinfo) {
+		weston_log("fatal: unrecognized pixel format: %s\n", s);
+
+		return -1;
+	}
+
+	/* GBM formats and DRM formats are identical. */
+	*gbm_format = pinfo->format;
+
+	return 0;
+}
+
+static uint32_t
+u32distance(uint32_t a, uint32_t b)
+{
+	if (a < b)
+		return b - a;
+	else
+		return a - b;
+}
+
+/** Choose equivalent mode
+ *
+ * If the two modes are not equivalent, return NULL.
+ * Otherwise return the mode that is more likely to work in place of both.
+ *
+ * None of the fuzzy matching criteria in this function have any justification.
+ *
+ * typedef struct _drmModeModeInfo {
+ *         uint32_t clock;
+ *         uint16_t hdisplay, hsync_start, hsync_end, htotal, hskew;
+ *         uint16_t vdisplay, vsync_start, vsync_end, vtotal, vscan;
+ *
+ *         uint32_t vrefresh;
+ *
+ *         uint32_t flags;
+ *         uint32_t type;
+ *         char name[DRM_DISPLAY_MODE_LEN];
+ * } drmModeModeInfo, *drmModeModeInfoPtr;
+ */
+static const drmModeModeInfo *
+drm_mode_pick_equivalent(const drmModeModeInfo *a, const drmModeModeInfo *b)
+{
+	uint32_t refresh_a, refresh_b;
+
+	if (a->hdisplay != b->hdisplay || a->vdisplay != b->vdisplay)
+		return NULL;
+
+	if (a->flags != b->flags)
+		return NULL;
+
+	/* kHz */
+	if (u32distance(a->clock, b->clock) > 500)
+		return NULL;
+
+	refresh_a = drm_refresh_rate_mHz(a);
+	refresh_b = drm_refresh_rate_mHz(b);
+	if (u32distance(refresh_a, refresh_b) > 50)
+		return NULL;
+
+	if ((a->type ^ b->type) & DRM_MODE_TYPE_PREFERRED) {
+		if (a->type & DRM_MODE_TYPE_PREFERRED)
+			return a;
+		else
+			return b;
+	}
+
+	return a;
+}
+
+/* If the given mode info is not already in the list, add it.
+ * If it is in the list, either keep the existing or replace it,
+ * depending on which one is "better".
+ */
+static int
+drm_output_try_add_mode(struct drm_output *output, const drmModeModeInfo *info)
+{
+	struct weston_mode *base;
+	struct drm_mode *mode;
+	struct drm_backend *backend;
+	const drmModeModeInfo *chosen = NULL;
+
+	assert(info);
+
+	wl_list_for_each(base, &output->base.mode_list, link) {
+		mode = to_drm_mode(base);
+		chosen = drm_mode_pick_equivalent(&mode->mode_info, info);
+		if (chosen)
+			break;
+	}
+
+	if (chosen == info) {
+		backend = to_drm_backend(output->base.compositor);
+		drm_output_destroy_mode(backend, mode);
+		chosen = NULL;
+	}
+
+	if (!chosen) {
+		mode = drm_output_add_mode(output, info);
+		if (!mode)
+			return -1;
+	}
+	/* else { the equivalent mode is already in the list } */
+
+	return 0;
+}
+
+/** Rewrite the output's mode list
+ *
+ * @param output The output.
+ * @return 0 on success, -1 on failure.
+ *
+ * Destroy all existing modes in the list, and reconstruct a new list from
+ * scratch, based on the currently attached heads.
+ *
+ * On failure the output's mode list may contain some modes.
+ */
+static int
+drm_output_update_modelist_from_heads(struct drm_output *output)
+{
+	struct drm_backend *backend = to_drm_backend(output->base.compositor);
+	struct weston_head *head_base;
+	struct drm_head *head;
+	int i;
+	int ret;
+
+	assert(!output->base.enabled);
+
+	drm_mode_list_destroy(backend, &output->base.mode_list);
+
+	wl_list_for_each(head_base, &output->base.head_list, output_link) {
+		head = to_drm_head(head_base);
+		for (i = 0; i < head->connector->count_modes; i++) {
+			ret = drm_output_try_add_mode(output,
+						&head->connector->modes[i]);
+			if (ret < 0)
+				return -1;
+		}
+	}
+
+	return 0;
 }
 
 /**
@@ -4438,17 +5669,35 @@ drm_output_choose_initial_mode(struct drm_backend *backend,
 	struct drm_mode *preferred = NULL;
 	struct drm_mode *current = NULL;
 	struct drm_mode *configured = NULL;
+	struct drm_mode *config_fall_back = NULL;
 	struct drm_mode *best = NULL;
 	struct drm_mode *drm_mode;
 	drmModeModeInfo drm_modeline;
 	int32_t width = 0;
 	int32_t height = 0;
 	uint32_t refresh = 0;
+	uint32_t aspect_width = 0;
+	uint32_t aspect_height = 0;
+	enum weston_mode_aspect_ratio aspect_ratio = WESTON_MODE_PIC_AR_NONE;
 	int n;
 
 	if (mode == WESTON_DRM_BACKEND_OUTPUT_PREFERRED && modeline) {
-		n = sscanf(modeline, "%dx%d@%d", &width, &height, &refresh);
-		if (n != 2 && n != 3) {
+		n = sscanf(modeline, "%dx%d@%d %u:%u", &width, &height,
+			   &refresh, &aspect_width, &aspect_height);
+		if (backend->aspect_ratio_supported && n == 5) {
+			if (aspect_width == 4 && aspect_height == 3)
+				aspect_ratio = WESTON_MODE_PIC_AR_4_3;
+			else if (aspect_width == 16 && aspect_height == 9)
+				aspect_ratio = WESTON_MODE_PIC_AR_16_9;
+			else if (aspect_width == 64 && aspect_height == 27)
+				aspect_ratio = WESTON_MODE_PIC_AR_64_27;
+			else if (aspect_width == 256 && aspect_height == 135)
+				aspect_ratio = WESTON_MODE_PIC_AR_256_135;
+			else
+				weston_log("Invalid modeline \"%s\" for output %s\n",
+					   modeline, output->base.name);
+		}
+		if (n != 2 && n != 3 && n != 5) {
 			width = -1;
 
 			if (parse_modeline(modeline, &drm_modeline) == 0) {
@@ -4465,8 +5714,13 @@ drm_output_choose_initial_mode(struct drm_backend *backend,
 	wl_list_for_each_reverse(drm_mode, &output->base.mode_list, base.link) {
 		if (width == drm_mode->base.width &&
 		    height == drm_mode->base.height &&
-		    (refresh == 0 || refresh == drm_mode->mode_info.vrefresh))
-			configured = drm_mode;
+		    (refresh == 0 || refresh == drm_mode->mode_info.vrefresh)) {
+			if (!backend->aspect_ratio_supported ||
+			    aspect_ratio == drm_mode->base.aspect_ratio)
+				configured = drm_mode;
+			else
+				config_fall_back = drm_mode;
+		}
 
 		if (memcmp(current_mode, &drm_mode->mode_info,
 			   sizeof *current_mode) == 0)
@@ -4490,6 +5744,9 @@ drm_output_choose_initial_mode(struct drm_backend *backend,
 	if (configured)
 		return configured;
 
+	if (config_fall_back)
+		return config_fall_back;
+
 	if (preferred)
 		return preferred;
 
@@ -4504,23 +5761,25 @@ drm_output_choose_initial_mode(struct drm_backend *backend,
 }
 
 static int
-connector_get_current_mode(drmModeConnector *connector, int drm_fd,
-			   drmModeModeInfo *mode)
+drm_head_read_current_setup(struct drm_head *head, struct drm_backend *backend)
 {
+	int drm_fd = backend->drm.fd;
 	drmModeEncoder *encoder;
 	drmModeCrtc *crtc;
 
 	/* Get the current mode on the crtc that's currently driving
 	 * this connector. */
-	encoder = drmModeGetEncoder(drm_fd, connector->encoder_id);
-	memset(mode, 0, sizeof *mode);
+	encoder = drmModeGetEncoder(drm_fd, head->connector->encoder_id);
 	if (encoder != NULL) {
+		head->inherited_crtc_id = encoder->crtc_id;
+
 		crtc = drmModeGetCrtc(drm_fd, encoder->crtc_id);
 		drmModeFreeEncoder(encoder);
+
 		if (crtc == NULL)
 			return -1;
 		if (crtc->mode_valid)
-			*mode = crtc->mode;
+			head->inherited_mode = crtc->mode;
 		drmModeFreeCrtc(crtc);
 	}
 
@@ -4534,14 +5793,18 @@ drm_output_set_mode(struct weston_output *base,
 {
 	struct drm_output *output = to_drm_output(base);
 	struct drm_backend *b = to_drm_backend(base->compositor);
+	struct drm_head *head = to_drm_head(weston_output_get_first_head(base));
 
 	struct drm_mode *current;
-	drmModeModeInfo crtc_mode;
 
-	if (connector_get_current_mode(output->connector, b->drm.fd, &crtc_mode) < 0)
+	if (output->virtual)
 		return -1;
 
-	current = drm_output_choose_initial_mode(b, output, mode, modeline, &crtc_mode);
+	if (drm_output_update_modelist_from_heads(output) < 0)
+		return -1;
+
+	current = drm_output_choose_initial_mode(b, output, mode, modeline,
+						 &head->inherited_mode);
 	if (!current)
 		return -1;
 
@@ -4569,7 +5832,7 @@ drm_output_set_gbm_format(struct weston_output *base,
 	 * supported by the primary plane; we just hope that the GBM format
 	 * works. */
 	if (!b->universal_planes)
-		output->scanout_plane->formats[0] = output->gbm_format;
+		output->scanout_plane->formats[0].format = output->gbm_format;
 }
 
 static void
@@ -4602,14 +5865,161 @@ drm_output_init_gamma_size(struct drm_output *output)
 	return 0;
 }
 
+static uint32_t
+drm_head_get_possible_crtcs_mask(struct drm_head *head)
+{
+	uint32_t possible_crtcs = 0;
+	drmModeEncoder *encoder;
+	int i;
+
+	for (i = 0; i < head->connector->count_encoders; i++) {
+		encoder = drmModeGetEncoder(head->backend->drm.fd,
+					    head->connector->encoders[i]);
+		if (!encoder)
+			continue;
+
+		possible_crtcs |= encoder->possible_crtcs;
+		drmModeFreeEncoder(encoder);
+	}
+
+	return possible_crtcs;
+}
+
+static int
+drm_crtc_get_index(drmModeRes *resources, uint32_t crtc_id)
+{
+	int i;
+
+	for (i = 0; i < resources->count_crtcs; i++) {
+		if (resources->crtcs[i] == crtc_id)
+			return i;
+	}
+
+	assert(0 && "unknown crtc id");
+	return -1;
+}
+
+/** Pick a CRTC that might be able to drive all attached connectors
+ *
+ * @param output The output whose attached heads to include.
+ * @param resources The DRM KMS resources.
+ * @return CRTC index, or -1 on failure or not found.
+ */
+static int
+drm_output_pick_crtc(struct drm_output *output, drmModeRes *resources)
+{
+	struct drm_backend *backend;
+	struct weston_head *base;
+	struct drm_head *head;
+	uint32_t possible_crtcs = 0xffffffff;
+	int existing_crtc[32];
+	unsigned j, n = 0;
+	uint32_t crtc_id;
+	int best_crtc_index = -1;
+	int fallback_crtc_index = -1;
+	int i;
+	bool match;
+
+	backend = to_drm_backend(output->base.compositor);
+
+	/* This algorithm ignores drmModeEncoder::possible_clones restriction,
+	 * because it is more often set wrong than not in the kernel. */
+
+	/* Accumulate a mask of possible crtcs and find existing routings. */
+	wl_list_for_each(base, &output->base.head_list, output_link) {
+		head = to_drm_head(base);
+
+		possible_crtcs &= drm_head_get_possible_crtcs_mask(head);
+
+		crtc_id = head->inherited_crtc_id;
+		if (crtc_id > 0 && n < ARRAY_LENGTH(existing_crtc))
+			existing_crtc[n++] = drm_crtc_get_index(resources,
+								crtc_id);
+	}
+
+	/* Find a crtc that could drive each connector individually at least,
+	 * and prefer existing routings. */
+	for (i = 0; i < resources->count_crtcs; i++) {
+		crtc_id = resources->crtcs[i];
+
+		/* Could the crtc not drive each connector? */
+		if (!(possible_crtcs & (1 << i)))
+			continue;
+
+		/* Is the crtc already in use? */
+		if (drm_output_find_by_crtc(backend, crtc_id))
+			continue;
+
+		/* Try to preserve the existing CRTC -> connector routing;
+		 * it makes initialisation faster, and also since we have a
+		 * very dumb picking algorithm, may preserve a better
+		 * choice. */
+		for (j = 0; j < n; j++) {
+			if (existing_crtc[j] == i)
+				return i;
+		}
+
+		/* Check if any other head had existing routing to this CRTC.
+		 * If they did, this is not the best CRTC as it might be needed
+		 * for another output we haven't enabled yet. */
+		match = false;
+		wl_list_for_each(base, &backend->compositor->head_list,
+				 compositor_link) {
+			head = to_drm_head(base);
+
+			if (head->base.output == &output->base)
+				continue;
+
+			if (weston_head_is_enabled(&head->base))
+				continue;
+
+			if (head->inherited_crtc_id == crtc_id) {
+				match = true;
+				break;
+			}
+		}
+		if (!match)
+			best_crtc_index = i;
+
+		fallback_crtc_index = i;
+	}
+
+	if (best_crtc_index != -1)
+		return best_crtc_index;
+
+	if (fallback_crtc_index != -1)
+		return fallback_crtc_index;
+
+	/* Likely possible_crtcs was empty due to asking for clones,
+	 * but since the DRM documentation says the kernel lies, let's
+	 * pick one crtc anyway. Trial and error is the only way to
+	 * be sure if something doesn't work. */
+
+	/* First pick any existing assignment. */
+	for (j = 0; j < n; j++) {
+		crtc_id = resources->crtcs[existing_crtc[j]];
+		if (!drm_output_find_by_crtc(backend, crtc_id))
+			return existing_crtc[j];
+	}
+
+	/* Otherwise pick any available crtc. */
+	for (i = 0; i < resources->count_crtcs; i++) {
+		crtc_id = resources->crtcs[i];
+
+		if (!drm_output_find_by_crtc(backend, crtc_id))
+			return i;
+	}
+
+	return -1;
+}
+
 /** Allocate a CRTC for the output
  *
  * @param output The output with no allocated CRTC.
  * @param resources DRM KMS resources.
- * @param connector The DRM KMS connector data.
  * @return 0 on success, -1 on failure.
  *
- * Finds a free CRTC that can drive the given connector, reserves the CRTC
+ * Finds a free CRTC that might drive the attached connectors, reserves the CRTC
  * for the output, and loads the CRTC properties.
  *
  * Populates the cursor and scanout planes.
@@ -4617,8 +6027,7 @@ drm_output_init_gamma_size(struct drm_output *output)
  * On failure, the output remains without a CRTC.
  */
 static int
-drm_output_init_crtc(struct drm_output *output,
-		     drmModeRes *resources, drmModeConnector *connector)
+drm_output_init_crtc(struct drm_output *output, drmModeRes *resources)
 {
 	struct drm_backend *b = to_drm_backend(output->base.compositor);
 	drmModeObjectPropertiesPtr props;
@@ -4626,9 +6035,10 @@ drm_output_init_crtc(struct drm_output *output,
 
 	assert(output->crtc_id == 0);
 
-	i = find_crtc_for_connector(b, resources, connector);
+	i = drm_output_pick_crtc(output, resources);
 	if (i < 0) {
-		weston_log("No usable crtc/encoder pair for connector.\n");
+		weston_log("Output '%s': No available CRTCs.\n",
+			   output->base.name);
 		return -1;
 	}
 
@@ -4660,6 +6070,8 @@ drm_output_init_crtc(struct drm_output *output,
 		drm_output_find_special_plane(b, output,
 					      WDRM_PLANE_TYPE_CURSOR);
 
+	wl_array_remove_uint32(&b->unused_crtcs, output->crtc_id);
+
 	return 0;
 
 err_crtc:
@@ -4679,6 +6091,7 @@ static void
 drm_output_fini_crtc(struct drm_output *output)
 {
 	struct drm_backend *b = to_drm_backend(output->base.compositor);
+	uint32_t *unused;
 
 	if (!b->universal_planes && !b->shutting_down) {
 		/* With universal planes, the 'special' planes are allocated at
@@ -4700,9 +6113,40 @@ drm_output_fini_crtc(struct drm_output *output)
 	}
 
 	drm_property_info_free(output->props_crtc, WDRM_CRTC__COUNT);
+
+	assert(output->crtc_id != 0);
+
+	unused = wl_array_add(&b->unused_crtcs, sizeof(*unused));
+	*unused = output->crtc_id;
+
+	/* Force resetting unused CRTCs */
+	b->state_invalid = true;
+
 	output->crtc_id = 0;
 	output->cursor_plane = NULL;
 	output->scanout_plane = NULL;
+}
+
+static void
+drm_output_print_modes(struct drm_output *output)
+{
+	struct weston_mode *m;
+	struct drm_mode *dm;
+	const char *aspect_ratio;
+
+	wl_list_for_each(m, &output->base.mode_list, link) {
+		dm = to_drm_mode(m);
+
+		aspect_ratio = aspect_ratio_to_string(m->aspect_ratio);
+		weston_log_continue(STAMP_SPACE "%dx%d@%.1f%s%s%s, %.1f MHz\n",
+				    m->width, m->height, m->refresh / 1000.0,
+				    aspect_ratio,
+				    m->flags & WL_OUTPUT_MODE_PREFERRED ?
+				    ", preferred" : "",
+				    m->flags & WL_OUTPUT_MODE_CURRENT ?
+				    ", current" : "",
+				    dm->mode_info.clock / 1000.0);
+	}
 }
 
 static int
@@ -4710,7 +6154,23 @@ drm_output_enable(struct weston_output *base)
 {
 	struct drm_output *output = to_drm_output(base);
 	struct drm_backend *b = to_drm_backend(base->compositor);
-	struct weston_mode *m;
+	drmModeRes *resources;
+	int ret;
+
+	assert(!output->virtual);
+
+	resources = drmModeGetResources(b->drm.fd);
+	if (!resources) {
+		weston_log("drmModeGetResources failed\n");
+		return -1;
+	}
+	ret = drm_output_init_crtc(output, resources);
+	drmModeFreeResources(resources);
+	if (ret < 0)
+		return -1;
+
+	if (drm_output_init_gamma_size(output) < 0)
+		goto err;
 
 	if (b->pageflip_timeout)
 		drm_output_pageflip_timer_create(output);
@@ -4725,14 +6185,7 @@ drm_output_enable(struct weston_output *base)
 		goto err;
 	}
 
-	if (output->backlight) {
-		weston_log("Initialized backlight, device %s\n",
-			   output->backlight->path);
-		output->base.set_backlight = drm_set_backlight;
-		output->base.backlight_current = drm_get_backlight(output);
-	} else {
-		weston_log("Failed to initialize backlight\n");
-	}
+	drm_output_init_backlight(output);
 
 	output->base.start_repaint_loop = drm_output_start_repaint_loop;
 	output->base.repaint = drm_output_repaint;
@@ -4752,24 +6205,15 @@ drm_output_enable(struct weston_output *base)
 				      &output->scanout_plane->base,
 				      &b->compositor->primary_plane);
 
-	wl_array_remove_uint32(&b->unused_connectors, output->connector_id);
-	wl_array_remove_uint32(&b->unused_crtcs, output->crtc_id);
-
-	weston_log("Output %s, (connector %d, crtc %d)\n",
-		   output->base.name, output->connector_id, output->crtc_id);
-	wl_list_for_each(m, &output->base.mode_list, link)
-		weston_log_continue(STAMP_SPACE "mode %dx%d@%.1f%s%s%s\n",
-				    m->width, m->height, m->refresh / 1000.0,
-				    m->flags & WL_OUTPUT_MODE_PREFERRED ?
-				    ", preferred" : "",
-				    m->flags & WL_OUTPUT_MODE_CURRENT ?
-				    ", current" : "",
-				    output->connector->count_modes == 0 ?
-				    ", built-in" : "");
+	weston_log("Output %s (crtc %d) video modes:\n",
+		   output->base.name, output->crtc_id);
+	drm_output_print_modes(output);
 
 	return 0;
 
 err:
+	drm_output_fini_crtc(output);
+
 	return -1;
 }
 
@@ -4778,7 +6222,6 @@ drm_output_deinit(struct weston_output *base)
 {
 	struct drm_output *output = to_drm_output(base);
 	struct drm_backend *b = to_drm_backend(base->compositor);
-	uint32_t *unused;
 
 	if (b->use_pixman)
 		drm_output_fini_pixman(output);
@@ -4801,20 +6244,19 @@ drm_output_deinit(struct weston_output *base)
 		}
 	}
 
-	unused = wl_array_add(&b->unused_connectors, sizeof(*unused));
-	*unused = output->connector_id;
-	unused = wl_array_add(&b->unused_crtcs, sizeof(*unused));
-	*unused = output->crtc_id;
-
-	/* Force programming unused connectors and crtcs. */
-	b->state_invalid = true;
+	drm_output_fini_crtc(output);
 }
+
+static void
+drm_head_destroy(struct drm_head *head);
 
 static void
 drm_output_destroy(struct weston_output *base)
 {
 	struct drm_output *output = to_drm_output(base);
 	struct drm_backend *b = to_drm_backend(base->compositor);
+
+	assert(!output->virtual);
 
 	if (output->page_flip_pending || output->vblank_pending ||
 	    output->atomic_complete_pending) {
@@ -4833,14 +6275,6 @@ drm_output_destroy(struct weston_output *base)
 
 	weston_output_release(&output->base);
 
-	drm_output_fini_crtc(output);
-
-	drm_property_info_free(output->props_conn, WDRM_CONNECTOR__COUNT);
-	drmModeFreeConnector(output->connector);
-
-	if (output->backlight)
-		backlight_destroy(output->backlight);
-
 	assert(!output->state_last);
 	drm_output_state_free(output->state_cur);
 
@@ -4851,6 +6285,8 @@ static int
 drm_output_disable(struct weston_output *base)
 {
 	struct drm_output *output = to_drm_output(base);
+
+	assert(!output->virtual);
 
 	if (output->page_flip_pending || output->vblank_pending ||
 	    output->atomic_complete_pending) {
@@ -4871,7 +6307,7 @@ drm_output_disable(struct weston_output *base)
 /**
  * Update the list of unused connectors and CRTCs
  *
- * This keeps the unused_connectors and unused_crtcs arrays up to date.
+ * This keeps the unused_crtc arrays up to date.
  *
  * @param b Weston backend structure
  * @param resources DRM resources for this device
@@ -4880,22 +6316,6 @@ static void
 drm_backend_update_unused_outputs(struct drm_backend *b, drmModeRes *resources)
 {
 	int i;
-
-	wl_array_release(&b->unused_connectors);
-	wl_array_init(&b->unused_connectors);
-
-	for (i = 0; i < resources->count_connectors; i++) {
-		struct drm_output *output;
-		uint32_t *connector_id;
-
-		output = drm_output_find_by_connector(b, resources->connectors[i]);
-		if (output && output->base.enabled)
-			continue;
-
-		connector_id = wl_array_add(&b->unused_connectors,
-					    sizeof(*connector_id));
-		*connector_id = resources->connectors[i];
-	}
 
 	wl_array_release(&b->unused_crtcs);
 	wl_array_init(&b->unused_crtcs);
@@ -4913,113 +6333,238 @@ drm_backend_update_unused_outputs(struct drm_backend *b, drmModeRes *resources)
 	}
 }
 
-/**
- * Create a Weston output structure
+/** Replace connector data and monitor information
  *
- * Given a DRM connector, create a matching drm_output structure and add it
- * to Weston's output list. It also takes ownership of the connector, which
- * is released when output is destroyed.
+ * @param head The head to update.
+ * @param connector The connector data to be owned by the head, must match
+ * the head's connector ID.
+ * @return 0 on success, -1 on failure.
  *
- * @param b Weston backend structure
- * @param resources DRM resources for this device
- * @param connector DRM connector to use for this new output
- * @param drm_device udev device pointer
- * @returns 0 on success, or -1 on failure
+ * Takes ownership of @c connector on success, not on failure.
+ *
+ * May schedule a heads changed call.
  */
 static int
-create_output_for_connector(struct drm_backend *b,
-			    drmModeRes *resources,
-			    drmModeConnector *connector,
-			    struct udev_device *drm_device)
+drm_head_assign_connector_info(struct drm_head *head,
+			       drmModeConnector *connector)
 {
-	struct drm_output *output;
-	drmModeObjectPropertiesPtr props;
-	struct drm_mode *drm_mode;
-	char *name;
+	drmModeObjectProperties *props;
 	const char *make = "unknown";
 	const char *model = "unknown";
 	const char *serial_number = "unknown";
-	int i;
+
+	assert(connector);
+	assert(head->connector_id == connector->connector_id);
+
+	props = drmModeObjectGetProperties(head->backend->drm.fd,
+					   head->connector_id,
+					   DRM_MODE_OBJECT_CONNECTOR);
+	if (!props) {
+		weston_log("Error: failed to get connector '%s' properties\n",
+			   head->base.name);
+		return -1;
+	}
+
+	if (head->connector)
+		drmModeFreeConnector(head->connector);
+	head->connector = connector;
+
+	drm_property_info_populate(head->backend, connector_props,
+				   head->props_conn,
+				   WDRM_CONNECTOR__COUNT, props);
+	find_and_parse_output_edid(head, props, &make, &model, &serial_number);
+	weston_head_set_monitor_strings(&head->base, make, model, serial_number);
+	weston_head_set_non_desktop(&head->base,
+				    check_non_desktop(head, props));
+	weston_head_set_subpixel(&head->base,
+		drm_subpixel_to_wayland(head->connector->subpixel));
+
+	weston_head_set_physical_size(&head->base, head->connector->mmWidth,
+				      head->connector->mmHeight);
+
+	drmModeFreeObjectProperties(props);
+
+	/* Unknown connection status is assumed disconnected. */
+	weston_head_set_connection_status(&head->base,
+			head->connector->connection == DRM_MODE_CONNECTED);
+
+	return 0;
+}
+
+static void
+drm_head_log_info(struct drm_head *head, const char *msg)
+{
+	if (head->base.connected) {
+		weston_log("DRM: head '%s' %s, connector %d is connected, "
+			   "EDID make '%s', model '%s', serial '%s'\n",
+			   head->base.name, msg, head->connector_id,
+			   head->base.make, head->base.model,
+			   head->base.serial_number ?: "");
+	} else {
+		weston_log("DRM: head '%s' %s, connector %d is disconnected.\n",
+			   head->base.name, msg, head->connector_id);
+	}
+}
+
+/** Update connector and monitor information
+ *
+ * @param head The head to update.
+ *
+ * Re-reads the DRM property lists for the connector and updates monitor
+ * information and connection status. This may schedule a heads changed call
+ * to the user.
+ */
+static void
+drm_head_update_info(struct drm_head *head)
+{
+	drmModeConnector *connector;
+
+	connector = drmModeGetConnector(head->backend->drm.fd,
+					head->connector_id);
+	if (!connector) {
+		weston_log("DRM: getting connector info for '%s' failed.\n",
+			   head->base.name);
+		return;
+	}
+
+	if (drm_head_assign_connector_info(head, connector) < 0)
+		drmModeFreeConnector(connector);
+
+	if (head->base.device_changed)
+		drm_head_log_info(head, "updated");
+}
+
+/**
+ * Create a Weston head for a connector
+ *
+ * Given a DRM connector, create a matching drm_head structure and add it
+ * to Weston's head list.
+ *
+ * @param b Weston backend structure
+ * @param connector_id DRM connector ID for the head
+ * @param drm_device udev device pointer
+ * @returns The new head, or NULL on failure.
+ */
+static struct drm_head *
+drm_head_create(struct drm_backend *backend, uint32_t connector_id,
+		struct udev_device *drm_device)
+{
+	struct drm_head *head;
+	drmModeConnector *connector;
+	char *name;
+
+	head = zalloc(sizeof *head);
+	if (!head)
+		return NULL;
+
+	connector = drmModeGetConnector(backend->drm.fd, connector_id);
+	if (!connector)
+		goto err_alloc;
+
+	name = make_connector_name(connector);
+	if (!name)
+		goto err_alloc;
+
+	weston_head_init(&head->base, name);
+	free(name);
+
+	head->connector_id = connector_id;
+	head->backend = backend;
+
+	head->backlight = backlight_init(drm_device, connector->connector_type);
+
+	if (drm_head_assign_connector_info(head, connector) < 0)
+		goto err_init;
+
+	if (head->connector->connector_type == DRM_MODE_CONNECTOR_LVDS ||
+	    head->connector->connector_type == DRM_MODE_CONNECTOR_eDP)
+		weston_head_set_internal(&head->base);
+
+	if (drm_head_read_current_setup(head, backend) < 0) {
+		weston_log("Failed to retrieve current mode from connector %d.\n",
+			   head->connector_id);
+		/* Not fatal. */
+	}
+
+	weston_compositor_add_head(backend->compositor, &head->base);
+	drm_head_log_info(head, "found");
+
+	return head;
+
+err_init:
+	weston_head_release(&head->base);
+
+err_alloc:
+	if (connector)
+		drmModeFreeConnector(connector);
+
+	free(head);
+
+	return NULL;
+}
+
+static void
+drm_head_destroy(struct drm_head *head)
+{
+	weston_head_release(&head->base);
+
+	drm_property_info_free(head->props_conn, WDRM_CONNECTOR__COUNT);
+	drmModeFreeConnector(head->connector);
+
+	if (head->backlight)
+		backlight_destroy(head->backlight);
+
+	free(head);
+}
+
+/**
+ * Create a Weston output structure
+ *
+ * Create an "empty" drm_output. This is the implementation of
+ * weston_backend::create_output.
+ *
+ * Creating an output is usually followed by drm_output_attach_head()
+ * and drm_output_enable() to make use of it.
+ *
+ * @param compositor The compositor instance.
+ * @param name Name for the new output.
+ * @returns The output, or NULL on failure.
+ */
+static struct weston_output *
+drm_output_create(struct weston_compositor *compositor, const char *name)
+{
+	struct drm_backend *b = to_drm_backend(compositor);
+	struct drm_output *output;
 
 	output = zalloc(sizeof *output);
 	if (output == NULL)
-		goto err_init;
+		return NULL;
 
-	output->connector = connector;
-	output->connector_id = connector->connector_id;
+	output->backend = b;
+	output->gbm_bo_flags = GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING;
 
-	output->backlight = backlight_init(drm_device,
-					   connector->connector_type);
-
-	name = make_connector_name(connector);
-	weston_output_init(&output->base, b->compositor, name);
-	free(name);
+	weston_output_init(&output->base, compositor, name);
 
 	output->base.enable = drm_output_enable;
 	output->base.destroy = drm_output_destroy;
 	output->base.disable = drm_output_disable;
+	output->base.attach_head = drm_output_attach_head;
+	output->base.detach_head = drm_output_detach_head;
 
 	output->destroy_pending = 0;
 	output->disable_pending = 0;
 
-	if (drm_output_init_crtc(output, resources, connector) < 0)
-		goto err_output;
-
-	props = drmModeObjectGetProperties(b->drm.fd, connector->connector_id,
-					   DRM_MODE_OBJECT_CONNECTOR);
-	if (!props) {
-		weston_log("failed to get connector properties\n");
-		goto err_output;
-	}
-	drm_property_info_populate(b, connector_props, output->props_conn,
-				   WDRM_CONNECTOR__COUNT, props);
-	find_and_parse_output_edid(b, output, props,
-				   &make, &model, &serial_number);
-	output->base.make = (char *)make;
-	output->base.model = (char *)model;
-	output->base.serial_number = (char *)serial_number;
-	output->base.subpixel = drm_subpixel_to_wayland(output->connector->subpixel);
-
-	drmModeFreeObjectProperties(props);
-
-	if (output->connector->connector_type == DRM_MODE_CONNECTOR_LVDS ||
-	    output->connector->connector_type == DRM_MODE_CONNECTOR_eDP)
-		output->base.connection_internal = true;
-
-	if (drm_output_init_gamma_size(output) < 0)
-		goto err_output;
-
 	output->state_cur = drm_output_state_alloc(output, NULL);
-
-	output->base.mm_width = output->connector->mmWidth;
-	output->base.mm_height = output->connector->mmHeight;
-
-	for (i = 0; i < output->connector->count_modes; i++) {
-		drm_mode = drm_output_add_mode(output, &output->connector->modes[i]);
-		if (!drm_mode) {
-			weston_log("failed to add mode\n");
-			goto err_output;
-		}
-	}
 
 	weston_compositor_add_pending_output(&output->base, b->compositor);
 
-	return 0;
-
-err_output:
-	drm_output_destroy(&output->base);
-	return -1;
-	/* no fallthrough! */
-
-err_init:
-	drmModeFreeConnector(connector);
-	return -1;
+	return &output->base;
 }
 
 static int
-create_outputs(struct drm_backend *b, struct udev_device *drm_device)
+drm_backend_create_heads(struct drm_backend *b, struct udev_device *drm_device)
 {
-	drmModeConnector *connector;
+	struct drm_head *head;
 	drmModeRes *resources;
 	int i;
 
@@ -5035,28 +6580,16 @@ create_outputs(struct drm_backend *b, struct udev_device *drm_device)
 	b->max_height = resources->max_height;
 
 	for (i = 0; i < resources->count_connectors; i++) {
-		int ret;
+		uint32_t connector_id = resources->connectors[i];
 
-		connector = drmModeGetConnector(b->drm.fd,
-						resources->connectors[i]);
-		if (connector == NULL)
-			continue;
-
-		if (connector->connection == DRM_MODE_CONNECTED) {
-			ret = create_output_for_connector(b, resources,
-							  connector, drm_device);
-			if (ret < 0)
-				weston_log("failed to create new connector\n");
-		} else {
-			drmModeFreeConnector(connector);
+		head = drm_head_create(b, connector_id, drm_device);
+		if (!head) {
+			weston_log("DRM: failed to create head for connector %d.\n",
+				   connector_id);
 		}
 	}
 
 	drm_backend_update_unused_outputs(b, resources);
-
-	if (wl_list_empty(&b->compositor->output_list) &&
-	    wl_list_empty(&b->compositor->pending_output_list))
-		weston_log("No currently active connector found.\n");
 
 	drmModeFreeResources(resources);
 
@@ -5064,12 +6597,11 @@ create_outputs(struct drm_backend *b, struct udev_device *drm_device)
 }
 
 static void
-update_outputs(struct drm_backend *b, struct udev_device *drm_device)
+drm_backend_update_heads(struct drm_backend *b, struct udev_device *drm_device)
 {
-	drmModeConnector *connector;
 	drmModeRes *resources;
-	struct drm_output *output, *next;
-	uint32_t *connected;
+	struct weston_head *base, *next;
+	struct drm_head *head;
 	int i;
 
 	resources = drmModeGetResources(b->drm.fd);
@@ -5078,76 +6610,45 @@ update_outputs(struct drm_backend *b, struct udev_device *drm_device)
 		return;
 	}
 
-	connected = calloc(resources->count_connectors, sizeof(uint32_t));
-	if (!connected) {
-		drmModeFreeResources(resources);
-		return;
-	}
-
-	/* collect new connects */
+	/* collect new connectors that have appeared, e.g. MST */
 	for (i = 0; i < resources->count_connectors; i++) {
 		uint32_t connector_id = resources->connectors[i];
 
-		connector = drmModeGetConnector(b->drm.fd, connector_id);
-		if (connector == NULL)
-			continue;
-
-		if (connector->connection != DRM_MODE_CONNECTED) {
-			drmModeFreeConnector(connector);
-			continue;
+		head = drm_head_find_by_connector(b, connector_id);
+		if (head) {
+			drm_head_update_info(head);
+		} else {
+			head = drm_head_create(b, connector_id, drm_device);
+			if (!head)
+				weston_log("DRM: failed to create head for hot-added connector %d.\n",
+					   connector_id);
 		}
-
-		connected[i] = connector_id;
-
-		if (drm_output_find_by_connector(b, connector_id)) {
-			drmModeFreeConnector(connector);
-			continue;
-		}
-
-		create_output_for_connector(b, resources,
-					    connector, drm_device);
-		weston_log("connector %d connected\n", connector_id);
 	}
 
-	wl_list_for_each_safe(output, next, &b->compositor->output_list,
-			      base.link) {
-		bool disconnected = true;
+	/* Remove connectors that have disappeared. */
+	wl_list_for_each_safe(base, next,
+			      &b->compositor->head_list, compositor_link) {
+		bool removed = true;
+
+		head = to_drm_head(base);
 
 		for (i = 0; i < resources->count_connectors; i++) {
-			if (connected[i] == output->connector_id) {
-				disconnected = false;
+			if (resources->connectors[i] == head->connector_id) {
+				removed = false;
 				break;
 			}
 		}
 
-		if (!disconnected)
+		if (!removed)
 			continue;
 
-		weston_log("connector %d disconnected\n", output->connector_id);
-		drm_output_destroy(&output->base);
-	}
-
-	wl_list_for_each_safe(output, next, &b->compositor->pending_output_list,
-			      base.link) {
-		bool disconnected = true;
-
-		for (i = 0; i < resources->count_connectors; i++) {
-			if (connected[i] == output->connector_id) {
-				disconnected = false;
-				break;
-			}
-		}
-
-		if (!disconnected)
-			continue;
-
-		weston_log("connector %d disconnected\n", output->connector_id);
-		drm_output_destroy(&output->base);
+		weston_log("DRM: head '%s' (connector %d) disappeared.\n",
+			   head->base.name, head->connector_id);
+		drm_head_destroy(head);
 	}
 
 	drm_backend_update_unused_outputs(b, resources);
 
-	free(connected);
 	drmModeFreeResources(resources);
 }
 
@@ -5177,7 +6678,7 @@ udev_drm_event(int fd, uint32_t mask, void *data)
 	event = udev_monitor_receive_device(b->udev_monitor);
 
 	if (udev_event_is_hotplug(b, event))
-		update_outputs(b, event);
+		drm_backend_update_heads(b, event);
 
 	udev_device_unref(event);
 
@@ -5188,6 +6689,7 @@ static void
 drm_destroy(struct weston_compositor *ec)
 {
 	struct drm_backend *b = to_drm_backend(ec);
+	struct weston_head *base, *next;
 
 	udev_input_destroy(&b->input);
 
@@ -5198,7 +6700,12 @@ drm_destroy(struct weston_compositor *ec)
 
 	destroy_sprites(b);
 
+	weston_debug_scope_destroy(b->debug);
+	b->debug = NULL;
 	weston_compositor_shutdown(ec);
+
+	wl_list_for_each_safe(base, next, &ec->head_list, compositor_link)
+		drm_head_destroy(to_drm_head(base));
 
 	if (b->gbm)
 		gbm_device_destroy(b->gbm);
@@ -5209,7 +6716,6 @@ drm_destroy(struct weston_compositor *ec)
 	weston_launcher_destroy(ec->launcher);
 
 	wl_array_release(&b->unused_crtcs);
-	wl_array_release(&b->unused_connectors);
 
 	close(b->drm.fd);
 	free(b->drm.filename);
@@ -5276,7 +6782,7 @@ drm_device_is_kms(struct drm_backend *b, struct udev_device *device)
 	const char *filename = udev_device_get_devnode(device);
 	const char *sysnum = udev_device_get_sysnum(device);
 	drmModeRes *res;
-	int id, fd;
+	int id = -1, fd;
 
 	if (!filename)
 		return false;
@@ -5481,7 +6987,7 @@ recorder_frame_notify(struct wl_listener *listener, void *data)
 		return;
 
 	ret = drmPrimeHandleToFD(b->drm.fd,
-				 output->scanout_plane->state_cur->fb->handle,
+				 output->scanout_plane->state_cur->fb->handles[0],
 				 DRM_CLOEXEC, &fd);
 	if (ret) {
 		weston_log("[libva recorder] "
@@ -5490,7 +6996,7 @@ recorder_frame_notify(struct wl_listener *listener, void *data)
 	}
 
 	ret = vaapi_recorder_frame(output->recorder, fd,
-				   output->scanout_plane->state_cur->fb->stride);
+				   output->scanout_plane->state_cur->fb->strides[0]);
 	if (ret < 0) {
 		weston_log("[libva recorder] aborted: %m\n");
 		recorder_destroy(output);
@@ -5569,11 +7075,14 @@ switch_to_gl_renderer(struct drm_backend *b)
 {
 	struct drm_output *output;
 	bool dmabuf_support_inited;
+	bool linux_explicit_sync_inited;
 
 	if (!b->use_pixman)
 		return;
 
 	dmabuf_support_inited = !!b->compositor->renderer->import_dmabuf;
+	linux_explicit_sync_inited =
+		b->compositor->capabilities & WESTON_CAP_EXPLICIT_SYNC;
 
 	weston_log("Switching to GL renderer\n");
 
@@ -5606,6 +7115,13 @@ switch_to_gl_renderer(struct drm_backend *b)
 			weston_log("Error: initializing dmabuf "
 				   "support failed.\n");
 	}
+
+	if (!linux_explicit_sync_inited &&
+	    (b->compositor->capabilities & WESTON_CAP_EXPLICIT_SYNC)) {
+		if (linux_explicit_synchronization_setup(b->compositor) < 0)
+			weston_log("Error: initializing explicit "
+				   " synchronization support failed.\n");
+	}
 }
 
 static void
@@ -5618,10 +7134,267 @@ renderer_switch_binding(struct weston_keyboard *keyboard,
 	switch_to_gl_renderer(b);
 }
 
+static void
+drm_virtual_output_start_repaint_loop(struct weston_output *output_base)
+{
+	weston_output_finish_frame(output_base, NULL,
+				   WP_PRESENTATION_FEEDBACK_INVALID);
+}
+
+static int
+drm_virtual_output_submit_frame(struct drm_output *output,
+				struct drm_fb *fb)
+{
+	struct drm_backend *b = to_drm_backend(output->base.compositor);
+	int fd, ret;
+
+	assert(fb->num_planes == 1);
+	ret = drmPrimeHandleToFD(b->drm.fd, fb->handles[0], DRM_CLOEXEC, &fd);
+	if (ret) {
+		weston_log("drmPrimeHandleFD failed, errno=%d\n", errno);
+		return -1;
+	}
+
+	drm_fb_ref(fb);
+	ret = output->virtual_submit_frame(&output->base, fd, fb->strides[0],
+					   fb);
+	if (ret < 0) {
+		drm_fb_unref(fb);
+		close(fd);
+	}
+	return ret;
+}
+
+static int
+drm_virtual_output_repaint(struct weston_output *output_base,
+			   pixman_region32_t *damage,
+			   void *repaint_data)
+{
+	struct drm_pending_state *pending_state = repaint_data;
+	struct drm_output_state *state = NULL;
+	struct drm_output *output = to_drm_output(output_base);
+	struct drm_plane *scanout_plane = output->scanout_plane;
+	struct drm_plane_state *scanout_state;
+
+	assert(output->virtual);
+
+	if (output->disable_pending || output->destroy_pending)
+		goto err;
+
+	/* Drop frame if there isn't free buffers */
+	if (!gbm_surface_has_free_buffers(output->gbm_surface)) {
+		weston_log("%s: Drop frame!!\n", __func__);
+		return -1;
+	}
+
+	assert(!output->state_last);
+
+	/* If planes have been disabled in the core, we might not have
+	 * hit assign_planes at all, so might not have valid output state
+	 * here. */
+	state = drm_pending_state_get_output(pending_state, output);
+	if (!state)
+		state = drm_output_state_duplicate(output->state_cur,
+						   pending_state,
+						   DRM_OUTPUT_STATE_CLEAR_PLANES);
+
+	drm_output_render(state, damage);
+	scanout_state = drm_output_state_get_plane(state, scanout_plane);
+	if (!scanout_state || !scanout_state->fb)
+		goto err;
+
+	if (drm_virtual_output_submit_frame(output, scanout_state->fb) < 0)
+		goto err;
+
+	return 0;
+
+err:
+	drm_output_state_free(state);
+	return -1;
+}
+
+static void
+drm_virtual_output_deinit(struct weston_output *base)
+{
+	struct drm_output *output = to_drm_output(base);
+
+	drm_output_fini_egl(output);
+
+	drm_virtual_plane_destroy(output->scanout_plane);
+}
+
+static void
+drm_virtual_output_destroy(struct weston_output *base)
+{
+	struct drm_output *output = to_drm_output(base);
+
+	assert(output->virtual);
+
+	if (output->base.enabled)
+		drm_virtual_output_deinit(&output->base);
+
+	weston_output_release(&output->base);
+
+	drm_output_state_free(output->state_cur);
+
+	free(output);
+}
+
+static int
+drm_virtual_output_enable(struct weston_output *output_base)
+{
+	struct drm_output *output = to_drm_output(output_base);
+	struct drm_backend *b = to_drm_backend(output_base->compositor);
+
+	assert(output->virtual);
+
+	if (b->use_pixman) {
+		weston_log("Not support pixman renderer on Virtual output\n");
+		goto err;
+	}
+
+	if (!output->virtual_submit_frame) {
+		weston_log("The virtual_submit_frame hook is not set\n");
+		goto err;
+	}
+
+	output->scanout_plane = drm_virtual_plane_create(b, output);
+	if (!output->scanout_plane) {
+		weston_log("Failed to find primary plane for output %s\n",
+			   output->base.name);
+		return -1;
+	}
+
+	if (drm_output_init_egl(output, b) < 0) {
+		weston_log("Failed to init output gl state\n");
+		goto err;
+	}
+
+	output->base.start_repaint_loop = drm_virtual_output_start_repaint_loop;
+	output->base.repaint = drm_virtual_output_repaint;
+	output->base.assign_planes = drm_assign_planes;
+	output->base.set_dpms = NULL;
+	output->base.switch_mode = NULL;
+	output->base.gamma_size = 0;
+	output->base.set_gamma = NULL;
+
+	weston_compositor_stack_plane(b->compositor,
+				      &output->scanout_plane->base,
+				      &b->compositor->primary_plane);
+
+	return 0;
+err:
+	return -1;
+}
+
+static int
+drm_virtual_output_disable(struct weston_output *base)
+{
+	struct drm_output *output = to_drm_output(base);
+
+	assert(output->virtual);
+
+	if (output->base.enabled)
+		drm_virtual_output_deinit(&output->base);
+
+	return 0;
+}
+
+static struct weston_output *
+drm_virtual_output_create(struct weston_compositor *c, char *name)
+{
+	struct drm_output *output;
+
+	output = zalloc(sizeof *output);
+	if (!output)
+		return NULL;
+
+	output->virtual = true;
+	output->gbm_bo_flags = GBM_BO_USE_LINEAR | GBM_BO_USE_RENDERING;
+
+	weston_output_init(&output->base, c, name);
+
+	output->base.enable = drm_virtual_output_enable;
+	output->base.destroy = drm_virtual_output_destroy;
+	output->base.disable = drm_virtual_output_disable;
+	output->base.attach_head = NULL;
+
+	output->state_cur = drm_output_state_alloc(output, NULL);
+
+	weston_compositor_add_pending_output(&output->base, c);
+
+	return &output->base;
+}
+
+static uint32_t
+drm_virtual_output_set_gbm_format(struct weston_output *base,
+				  const char *gbm_format)
+{
+	struct drm_output *output = to_drm_output(base);
+	struct drm_backend *b = to_drm_backend(base->compositor);
+
+	if (parse_gbm_format(gbm_format, b->gbm_format, &output->gbm_format) == -1)
+		output->gbm_format = b->gbm_format;
+
+	return output->gbm_format;
+}
+
+static void
+drm_virtual_output_set_submit_frame_cb(struct weston_output *output_base,
+				       submit_frame_cb cb)
+{
+	struct drm_output *output = to_drm_output(output_base);
+
+	output->virtual_submit_frame = cb;
+}
+
+static int
+drm_virtual_output_get_fence_fd(struct weston_output *output_base)
+{
+	return gl_renderer->create_fence_fd(output_base);
+}
+
+static void
+drm_virtual_output_buffer_released(struct drm_fb *fb)
+{
+	drm_fb_unref(fb);
+}
+
+static void
+drm_virtual_output_finish_frame(struct weston_output *output_base,
+				struct timespec *stamp,
+				uint32_t presented_flags)
+{
+	struct drm_output *output = to_drm_output(output_base);
+	struct drm_plane_state *ps;
+
+	wl_list_for_each(ps, &output->state_cur->plane_list, link)
+		ps->complete = true;
+
+	drm_output_state_free(output->state_last);
+	output->state_last = NULL;
+
+	weston_output_finish_frame(&output->base, stamp, presented_flags);
+
+	/* We can't call this from frame_notify, because the output's
+	 * repaint needed flag is cleared just after that */
+	if (output->recorder)
+		weston_output_schedule_repaint(&output->base);
+}
+
 static const struct weston_drm_output_api api = {
 	drm_output_set_mode,
 	drm_output_set_gbm_format,
 	drm_output_set_seat,
+};
+
+static const struct weston_drm_virtual_output_api virt_api = {
+	drm_virtual_output_create,
+	drm_virtual_output_set_gbm_format,
+	drm_virtual_output_set_submit_frame_cb,
+	drm_virtual_output_get_fence_fd,
+	drm_virtual_output_buffer_released,
+	drm_virtual_output_finish_frame
 };
 
 static struct drm_backend *
@@ -5632,7 +7405,15 @@ drm_backend_create(struct weston_compositor *compositor,
 	struct udev_device *drm_device;
 	struct wl_event_loop *loop;
 	const char *seat_id = default_seat;
+	const char *session_seat;
 	int ret;
+
+	session_seat = getenv("XDG_SEAT");
+	if (session_seat)
+		seat_id = session_seat;
+
+	if (config->seat_id)
+		seat_id = config->seat_id;
 
 	weston_log("initializing drm backend\n");
 
@@ -5643,30 +7424,20 @@ drm_backend_create(struct weston_compositor *compositor,
 	b->state_invalid = true;
 	b->drm.fd = -1;
 	wl_array_init(&b->unused_crtcs);
-	wl_array_init(&b->unused_connectors);
 
-	/*
-	 * KMS support for hardware planes cannot properly synchronize
-	 * without nuclear page flip. Without nuclear/atomic, hw plane
-	 * and cursor plane updates would either tear or cause extra
-	 * waits for vblanks which means dropping the compositor framerate
-	 * to a fraction. For cursors, it's not so bad, so they are
-	 * enabled.
-	 *
-	 * These can be enabled again when nuclear/atomic support lands.
-	 */
-	b->sprites_are_broken = 1;
 	b->compositor = compositor;
 	b->use_pixman = config->use_pixman;
 	b->pageflip_timeout = config->pageflip_timeout;
+	b->use_pixman_shadow = config->use_pixman_shadow;
+
+	b->debug = weston_compositor_add_debug_scope(compositor, "drm-backend",
+						     "Debug messages from DRM/KMS backend\n",
+					     	     NULL, NULL);
 
 	compositor->backend = &b->base;
 
 	if (parse_gbm_format(config->gbm_format, GBM_FORMAT_XRGB8888, &b->gbm_format) < 0)
 		goto err_compositor;
-
-	if (config->seat_id)
-		seat_id = config->seat_id;
 
 	/* Check if we run drm-backend using weston-launch */
 	compositor->launcher = weston_launcher_connect(compositor, config->tty,
@@ -5717,6 +7488,7 @@ drm_backend_create(struct weston_compositor *compositor,
 	b->base.repaint_begin = drm_repaint_begin;
 	b->base.repaint_flush = drm_repaint_flush;
 	b->base.repaint_cancel = drm_repaint_cancel;
+	b->base.create_output = drm_output_create;
 
 	weston_setup_vt_switch_bindings(compositor);
 
@@ -5730,8 +7502,8 @@ drm_backend_create(struct weston_compositor *compositor,
 		goto err_sprite;
 	}
 
-	if (create_outputs(b, drm_device) < 0) {
-		weston_log("failed to create output for %s\n", b->drm.filename);
+	if (drm_backend_create_heads(b, drm_device) < 0) {
+		weston_log("Failed to create heads for %s\n", b->drm.filename);
 		goto err_udev_input;
 	}
 
@@ -5781,11 +7553,25 @@ drm_backend_create(struct weston_compositor *compositor,
 				   "support failed.\n");
 	}
 
+	if (compositor->capabilities & WESTON_CAP_EXPLICIT_SYNC) {
+		if (linux_explicit_synchronization_setup(compositor) < 0)
+			weston_log("Error: initializing explicit "
+				   " synchronization support failed.\n");
+	}
+
 	ret = weston_plugin_api_register(compositor, WESTON_DRM_OUTPUT_API_NAME,
 					 &api, sizeof(api));
 
 	if (ret < 0) {
 		weston_log("Failed to register output API.\n");
+		goto err_udev_monitor;
+	}
+
+	ret = weston_plugin_api_register(compositor,
+					 WESTON_DRM_VIRTUAL_OUTPUT_API_NAME,
+					 &virt_api, sizeof(virt_api));
+	if (ret < 0) {
+		weston_log("Failed to register virtual output API.\n");
 		goto err_udev_monitor;
 	}
 
@@ -5820,6 +7606,7 @@ err_compositor:
 static void
 config_init_to_defaults(struct weston_drm_backend_config *config)
 {
+	config->use_pixman_shadow = true;
 }
 
 WL_EXPORT int

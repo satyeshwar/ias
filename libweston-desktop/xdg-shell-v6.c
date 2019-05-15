@@ -515,7 +515,7 @@ weston_desktop_xdg_toplevel_protocol_set_fullscreen(struct wl_client *wl_client,
 	struct weston_output *output = NULL;
 
 	if (output_resource != NULL)
-		output = weston_output_from_resource(output_resource);
+		output = weston_head_from_resource(output_resource)->output;
 
 	weston_desktop_xdg_toplevel_ensure_added(toplevel);
 	weston_desktop_api_fullscreen_requested(toplevel->base.desktop, dsurface,
@@ -829,6 +829,13 @@ weston_desktop_xdg_popup_update_position(struct weston_desktop_surface *dsurface
 static void
 weston_desktop_xdg_popup_committed(struct weston_desktop_xdg_popup *popup)
 {
+	struct weston_surface *wsurface =
+		weston_desktop_surface_get_surface (popup->base.desktop_surface);
+	struct weston_view *view;
+
+	wl_list_for_each(view, &wsurface->views, surface_link)
+		weston_view_update_transform(view);
+
 	if (!popup->committed)
 		weston_desktop_xdg_surface_schedule_configure(&popup->base);
 	popup->committed = true;

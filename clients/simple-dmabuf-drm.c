@@ -39,6 +39,7 @@
 #include <signal.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <errno.h>
 
 #include <xf86drm.h>
 
@@ -49,16 +50,21 @@
 #ifdef HAVE_LIBDRM_FREEDRENO
 #include <freedreno/freedreno_drmif.h>
 #endif
+#ifdef HAVE_LIBDRM_ETNAVIV
+#include <etnaviv_drmif.h>
+#endif
 #include <drm_fourcc.h>
 
 #include <wayland-client.h>
 #include "shared/zalloc.h"
-#include "shared/platform.h"
-#include "xdg-shell-unstable-v6-client-protocol.h"
+#include "xdg-shell-client-protocol.h"
 #include "fullscreen-shell-unstable-v1-client-protocol.h"
 #include "linux-dmabuf-unstable-v1-client-protocol.h"
 
-extern const unsigned nv12_tiled[];
+#ifndef DRM_FORMAT_MOD_LINEAR
+#define DRM_FORMAT_MOD_LINEAR 0
+#endif
+
 struct buffer;
 
 /* Possible options that affect the displayed image */
@@ -71,14 +77,13 @@ struct display {
 	struct wl_display *display;
 	struct wl_registry *registry;
 	struct wl_compositor *compositor;
-	struct zxdg_shell_v6 *shell;
+	struct xdg_wm_base *wm_base;
 	struct zwp_fullscreen_shell_v1 *fshell;
 	struct zwp_linux_dmabuf_v1 *dmabuf;
 	int xrgb8888_format_found;
 	int nv12_format_found;
-	int nv12_modifier_found;
+	uint64_t nv12_modifier;
 	int req_dmabuf_immediate;
-	int req_dmabuf_modifiers;
 };
 
 struct drm_device {
@@ -108,6 +113,10 @@ struct buffer {
 	struct fd_device *fd_dev;
 	struct fd_bo *fd_bo;
 #endif /* HAVE_LIBDRM_FREEDRENO */
+#if HAVE_LIBDRM_ETNAVIV
+	struct etna_device *etna_dev;
+	struct etna_bo *etna_bo;
+#endif /* HAVE_LIBDRM_ETNAVIV */
 
 	uint32_t gem_handle;
 	int dmabuf_fd;
@@ -126,8 +135,8 @@ struct window {
 	struct display *display;
 	int width, height;
 	struct wl_surface *surface;
-	struct zxdg_surface_v6 *xdg_surface;
-	struct zxdg_toplevel_v6 *xdg_toplevel;
+	struct xdg_surface *xdg_surface;
+	struct xdg_toplevel *xdg_toplevel;
 	struct buffer buffers[NUM_BUFFERS];
 	struct buffer *prev_buffer;
 	struct wl_callback *callback;
@@ -244,21 +253,14 @@ static int
 fd_bo_export_to_prime(struct buffer *buf)
 {
 	buf->dmabuf_fd = fd_bo_dmabuf(buf->fd_bo);
-	if (buf->dmabuf_fd > 0)
-		return 0;
-
-	return 1;
+	return buf->dmabuf_fd < 0;
 }
 
 static int
 fd_map_bo(struct buffer *buf)
 {
 	buf->mmap = fd_bo_map(buf->fd_bo);
-
-	if (buf->mmap != NULL)
-		return 1;
-
-	return 0;
+	return buf->mmap != NULL;
 }
 
 static void
@@ -272,9 +274,59 @@ fd_device_destroy(struct buffer *buf)
 	fd_device_del(buf->fd_dev);
 }
 #endif /* HAVE_LIBDRM_FREEDRENO */
+#ifdef HAVE_LIBDRM_ETNAVIV
+
+static int
+etna_alloc_bo(struct buffer *buf)
+{
+	int flags = DRM_ETNA_GEM_CACHE_WC;
+	int size;
+
+	buf->stride = ALIGN(buf->width, 32) * buf->bpp / 8;
+	size = 	buf->stride * buf->height;
+	buf->etna_dev = etna_device_new(buf->drm_fd);
+	buf->etna_bo = etna_bo_new(buf->etna_dev, size, flags);
+
+	return buf->etna_bo != NULL;
+}
 
 static void
-fill_content(struct buffer *my_buf)
+etna_free_bo(struct buffer *buf)
+{
+	etna_bo_del(buf->etna_bo);
+}
+
+static int
+etna_bo_export_to_prime(struct buffer *buf)
+{
+	buf->dmabuf_fd = etna_bo_dmabuf(buf->etna_bo);
+	return buf->dmabuf_fd < 0;
+}
+
+static int
+etna_map_bo(struct buffer *buf)
+{
+	buf->mmap = etna_bo_map(buf->etna_bo);
+	return buf->mmap != NULL;
+}
+
+static void
+etna_unmap_bo(struct buffer *buf)
+{
+	if (munmap(buf->mmap, buf->stride * buf->height) < 0)
+		fprintf(stderr, "Failed to unmap buffer: %s", strerror(errno));
+	buf->mmap = NULL;
+}
+
+static void
+etna_device_destroy(struct buffer *buf)
+{
+	etna_device_del(buf->etna_dev);
+}
+#endif /* HAVE_LIBDRM_ENTAVIV */
+
+static void
+fill_content(struct buffer *my_buf, uint64_t modifier)
 {
 	int x = 0, y = 0;
 	uint32_t *pix;
@@ -282,11 +334,31 @@ fill_content(struct buffer *my_buf)
 	assert(my_buf->mmap);
 
 	if (my_buf->format == DRM_FORMAT_NV12) {
-		pix = (uint32_t *) my_buf->mmap;
-		for (y = 0; y < my_buf->height; y++)
-			memcpy(&pix[y * my_buf->width / 4],
-			       &nv12_tiled[my_buf->width * y / 4],
-			       my_buf->width);
+		if (modifier == DRM_FORMAT_MOD_SAMSUNG_64_32_TILE) {
+			pix = (uint32_t *) my_buf->mmap;
+			for (y = 0; y < my_buf->height; y++)
+				memcpy(&pix[y * my_buf->width / 4],
+				       &nv12_tiled[my_buf->width * y / 4],
+				       my_buf->width);
+		}
+		else if (modifier == DRM_FORMAT_MOD_LINEAR) {
+			uint8_t *pix8;
+			/* first plane: Y (2/3 of the buffer)	*/
+			for (y = 0; y < my_buf->height * 2/3; y++) {
+				pix8 = my_buf->mmap + y * my_buf->stride;
+				for (x = 0; x < my_buf->width; x++)
+					*pix8++ = x % 0xff;
+			}
+			/* second plane (CbCr) is half the size of Y
+			   plane (last 1/3 of the buffer) */
+			for (y = my_buf->height * 2/3; y < my_buf->height; y++) {
+				pix8 = my_buf->mmap + y * my_buf->stride;
+				for (x = 0; x < my_buf->width; x+=2) {
+					*pix8++ = x % 256;
+					*pix8++ = y % 256;
+				}
+			}
+		}
 	}
 	else {
 		for (y = 0; y < my_buf->height; y++) {
@@ -320,8 +392,11 @@ drm_device_init(struct buffer *buf)
 #ifdef HAVE_LIBDRM_INTEL
 	else if (!strcmp(dev->name, "i915")) {
 		buf->bufmgr = drm_intel_bufmgr_gem_init(buf->drm_fd, 32);
-		if (!buf->bufmgr)
+		if (!buf->bufmgr) {
+			free(dev->name);
+			free(dev);
 			return 0;
+		}
 		dev->alloc_bo = intel_alloc_bo;
 		dev->free_bo = intel_free_bo;
 		dev->export_bo_to_prime = intel_bo_export_to_prime;
@@ -340,9 +415,20 @@ drm_device_init(struct buffer *buf)
 		dev->device_destroy = fd_device_destroy;
 	}
 #endif
+#ifdef HAVE_LIBDRM_ETNAVIV
+	else if (!strcmp(dev->name, "etnaviv")) {
+		dev->alloc_bo = etna_alloc_bo;
+		dev->free_bo = etna_free_bo;
+		dev->export_bo_to_prime = etna_bo_export_to_prime;
+		dev->map_bo = etna_map_bo;
+		dev->unmap_bo = etna_unmap_bo;
+		dev->device_destroy = etna_device_destroy;
+	}
+#endif
 	else {
 		fprintf(stderr, "Error: drm device %s unsupported.\n",
 			dev->name);
+		free(dev->name);
 		free(dev);
 		return 0;
 	}
@@ -421,7 +507,7 @@ create_dmabuf_buffer(struct display *display, struct buffer *buffer,
 		/* adjust height for allocation of NV12 Y and UV planes */
 		buffer->height = height * 3 / 2;
 		buffer->bpp = 8;
-		modifier = DRM_FORMAT_MOD_SAMSUNG_64_32_TILE;
+		modifier = display->nv12_modifier;
 		break;
 	default:
 		buffer->height = height;
@@ -438,7 +524,7 @@ create_dmabuf_buffer(struct display *display, struct buffer *buffer,
 		fprintf(stderr, "map_bo failed\n");
 		goto error2;
 	}
-	fill_content(buffer);
+	fill_content(buffer, modifier);
 	drm_dev->unmap_bo(buffer);
 
 	if (drm_dev->export_bo_to_prime(buffer) != 0) {
@@ -506,36 +592,36 @@ error:
 }
 
 static void
-xdg_surface_handle_configure(void *data, struct zxdg_surface_v6 *surface,
+xdg_surface_handle_configure(void *data, struct xdg_surface *surface,
 			     uint32_t serial)
 {
 	struct window *window = data;
 
-	zxdg_surface_v6_ack_configure(surface, serial);
+	xdg_surface_ack_configure(surface, serial);
 
 	if (window->initialized && window->wait_for_configure)
 		redraw(window, NULL, 0);
 	window->wait_for_configure = false;
 }
 
-static const struct zxdg_surface_v6_listener xdg_surface_listener = {
+static const struct xdg_surface_listener xdg_surface_listener = {
 	xdg_surface_handle_configure,
 };
 
 static void
-xdg_toplevel_handle_configure(void *data, struct zxdg_toplevel_v6 *toplevel,
+xdg_toplevel_handle_configure(void *data, struct xdg_toplevel *toplevel,
 			      int32_t width, int32_t height,
 			      struct wl_array *states)
 {
 }
 
 static void
-xdg_toplevel_handle_close(void *data, struct zxdg_toplevel_v6 *xdg_toplevel)
+xdg_toplevel_handle_close(void *data, struct xdg_toplevel *xdg_toplevel)
 {
 	running = 0;
 }
 
-static const struct zxdg_toplevel_v6_listener xdg_toplevel_listener = {
+static const struct xdg_toplevel_listener xdg_toplevel_listener = {
 	xdg_toplevel_handle_configure,
 	xdg_toplevel_handle_close,
 };
@@ -558,25 +644,25 @@ create_window(struct display *display, int width, int height, int format,
 	window->height = height;
 	window->surface = wl_compositor_create_surface(display->compositor);
 
-	if (display->shell) {
+	if (display->wm_base) {
 		window->xdg_surface =
-			zxdg_shell_v6_get_xdg_surface(display->shell,
-						      window->surface);
+			xdg_wm_base_get_xdg_surface(display->wm_base,
+						    window->surface);
 
 		assert(window->xdg_surface);
 
-		zxdg_surface_v6_add_listener(window->xdg_surface,
-					     &xdg_surface_listener, window);
+		xdg_surface_add_listener(window->xdg_surface,
+					 &xdg_surface_listener, window);
 
 		window->xdg_toplevel =
-			zxdg_surface_v6_get_toplevel(window->xdg_surface);
+			xdg_surface_get_toplevel(window->xdg_surface);
 
 		assert(window->xdg_toplevel);
 
-		zxdg_toplevel_v6_add_listener(window->xdg_toplevel,
-					      &xdg_toplevel_listener, window);
+		xdg_toplevel_add_listener(window->xdg_toplevel,
+					  &xdg_toplevel_listener, window);
 
-		zxdg_toplevel_v6_set_title(window->xdg_toplevel, "simple-dmabuf");
+		xdg_toplevel_set_title(window->xdg_toplevel, "simple-dmabuf");
 
 		window->wait_for_configure = true;
 		wl_surface_commit(window->surface);
@@ -621,9 +707,9 @@ destroy_window(struct window *window)
 	}
 
 	if (window->xdg_toplevel)
-		zxdg_toplevel_v6_destroy(window->xdg_toplevel);
+		xdg_toplevel_destroy(window->xdg_toplevel);
 	if (window->xdg_surface)
-		zxdg_surface_v6_destroy(window->xdg_surface);
+		xdg_surface_destroy(window->xdg_surface);
 	wl_surface_destroy(window->surface);
 	free(window);
 }
@@ -686,10 +772,13 @@ dmabuf_modifiers(void *data, struct zwp_linux_dmabuf_v1 *zwp_linux_dmabuf,
 		d->xrgb8888_format_found = 1;
 		break;
 	case DRM_FORMAT_NV12:
-		d->nv12_format_found = 1;
-		if (modifier == DRM_FORMAT_MOD_SAMSUNG_64_32_TILE)
-			d->nv12_modifier_found = 1;
-		break;
+		switch (modifier) {
+		case DRM_FORMAT_MOD_SAMSUNG_64_32_TILE:
+		case DRM_FORMAT_MOD_LINEAR:
+			d->nv12_format_found = 1;
+			d->nv12_modifier = modifier;
+			break;
+		}
 	default:
 		break;
 	}
@@ -707,13 +796,13 @@ static const struct zwp_linux_dmabuf_v1_listener dmabuf_listener = {
 };
 
 static void
-xdg_shell_ping(void *data, struct zxdg_shell_v6 *shell, uint32_t serial)
+xdg_wm_base_ping(void *data, struct xdg_wm_base *shell, uint32_t serial)
 {
-	zxdg_shell_v6_pong(shell, serial);
+	xdg_wm_base_pong(shell, serial);
 }
 
-static const struct zxdg_shell_v6_listener xdg_shell_listener = {
-	xdg_shell_ping,
+static const struct xdg_wm_base_listener wm_base_listener = {
+	xdg_wm_base_ping,
 };
 
 static void
@@ -726,24 +815,18 @@ registry_handle_global(void *data, struct wl_registry *registry,
 		d->compositor =
 			wl_registry_bind(registry,
 					 id, &wl_compositor_interface, 1);
-	} else if (strcmp(interface, "zxdg_shell_v6") == 0) {
-		d->shell = wl_registry_bind(registry,
-					    id, &zxdg_shell_v6_interface, 1);
-		zxdg_shell_v6_add_listener(d->shell, &xdg_shell_listener, d);
+	} else if (strcmp(interface, "xdg_wm_base") == 0) {
+		d->wm_base = wl_registry_bind(registry,
+					      id, &xdg_wm_base_interface, 1);
+		xdg_wm_base_add_listener(d->wm_base, &wm_base_listener, d);
 	} else if (strcmp(interface, "zwp_fullscreen_shell_v1") == 0) {
 		d->fshell = wl_registry_bind(registry,
 					     id, &zwp_fullscreen_shell_v1_interface, 1);
 	} else if (strcmp(interface, "zwp_linux_dmabuf_v1") == 0) {
-		int ver;
-		if (d->req_dmabuf_modifiers)
-			ver = 3;
-		else if (d->req_dmabuf_immediate)
-			ver = 2;
-		else
-			ver = 1;
+		if (version < 3)
+			return;
 		d->dmabuf = wl_registry_bind(registry,
-					     id, &zwp_linux_dmabuf_v1_interface,
-					     ver);
+					     id, &zwp_linux_dmabuf_v1_interface, 3);
 		zwp_linux_dmabuf_v1_add_listener(d->dmabuf, &dmabuf_listener, d);
 	}
 }
@@ -763,27 +846,16 @@ static struct display *
 create_display(int opts, int format)
 {
 	struct display *display;
-	const char *extensions;
 
 	display = malloc(sizeof *display);
 	if (display == NULL) {
 		fprintf(stderr, "out of memory\n");
-		exit(1);
+		return NULL;
 	}
 	display->display = wl_display_connect(NULL);
 	assert(display->display);
 
 	display->req_dmabuf_immediate = opts & OPT_IMMEDIATE;
-	display->req_dmabuf_modifiers = (format == DRM_FORMAT_NV12);
-
-	/*
-	 * hard code format if the platform egl doesn't support format
-	 * querying / advertising.
-	 */
-	extensions = eglQueryString(EGL_NO_DISPLAY, EGL_EXTENSIONS);
-	if (extensions && !weston_check_egl_extension(extensions,
-				"EGL_EXT_image_dma_buf_import_modifiers"))
-		display->xrgb8888_format_found = 1;
 
 	display->registry = wl_display_get_registry(display->display);
 	wl_registry_add_listener(display->registry,
@@ -791,18 +863,16 @@ create_display(int opts, int format)
 	wl_display_roundtrip(display->display);
 	if (display->dmabuf == NULL) {
 		fprintf(stderr, "No zwp_linux_dmabuf global\n");
-		exit(1);
+		return NULL;
 	}
 
 	wl_display_roundtrip(display->display);
 
 	if ((format == DRM_FORMAT_XRGB8888 && !display->xrgb8888_format_found) ||
-		(format == DRM_FORMAT_NV12 && (!display->nv12_format_found ||
-			!display->nv12_modifier_found))) {
+	        (format == DRM_FORMAT_NV12 && !display->nv12_format_found)) {
 		fprintf(stderr, "requested format is not available\n");
-		exit(1);
+		return NULL;
 	}
-
 	return display;
 }
 
@@ -812,8 +882,8 @@ destroy_display(struct display *display)
 	if (display->dmabuf)
 		zwp_linux_dmabuf_v1_destroy(display->dmabuf);
 
-	if (display->shell)
-		zxdg_shell_v6_destroy(display->shell);
+	if (display->wm_base)
+		xdg_wm_base_destroy(display->wm_base);
 
 	if (display->fshell)
 		zwp_fullscreen_shell_v1_release(display->fshell);
@@ -842,7 +912,7 @@ print_usage_and_exit(void)
 		"\t'--y-inverted=<>'\n\t\t0 to not pass Y_INVERTED flag,"
 		"\n\t\t1 to pass Y_INVERTED flag\n"
 		"\t'--import-format=<>'\n\t\tXRGB to import dmabuf as XRGB8888,"
-		"\n\t\tNV12 to import as multi plane NV12 with tiling modifier\n");
+		"\n\t\tNV12 to import as multi plane NV12\n");
 	exit(0);
 }
 
@@ -910,6 +980,8 @@ main(int argc, char **argv)
 	}
 
 	display = create_display(opts, import_format);
+	if (!display)
+		return 1;
 	window = create_window(display, 256, 256, import_format, opts);
 	if (!window)
 		return 1;
