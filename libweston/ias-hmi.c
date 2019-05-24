@@ -653,29 +653,36 @@ bool global_filter_func(const struct wl_client *client,
 	pid_t pid;
 	const struct wl_interface *interface = wl_global_get_interface(global);
 	struct ias_shell *shell = data;
-	struct ias_output *ias_output;
+	struct ias_output *ias_output = NULL;
 	struct soc_node *node;
-	char *p1, *p2;
+	char *p1;
 	int soc_num;
+	struct weston_head *head = NULL;
 
 	wl_client_get_credentials((struct wl_client *)client, &pid, NULL, NULL);
 
-	if(!strcmp(interface->name, "wl_output") ||
-			!strcmp(interface->name, "ias_output")) {
-
+	if(!strcmp(interface->name, "wl_output")) {
+		head = wl_global_get_user_data(global);
+		ias_output = (struct ias_output*)head->output;
+	} else if(!strcmp(interface->name, "ias_output")) {
 		ias_output = wl_global_get_user_data(global);
+	}
+
+	if(ias_output && ias_output->name) {
 
 		wl_list_for_each(node, &shell->soc_list, link) {
 			if(pid == (int32_t) node->pid) {
 				if(!strncmp(ias_output->name, "SOC", 3)) {
 
-					/* This is a remote display */
-					p1 = strstr(ias_output->name, "SOC");
+					/*
+					 * This is a remote display, skip the first 3 letters and
+					 * get the remaining
+					 */
+					p1 = strtok(&(ias_output->name[3]), " ");
 					if(!p1) {
 						return true;
 					}
-					p2 = strchr(p1, ' ');
-					soc_num = atoi(p2);
+					soc_num = atoi(p1);
 					if(!(node->soc & 1 << (soc_num -1))) {
 						return false;
 					}
